@@ -347,6 +347,11 @@ cxx=(g++ -O2 -fno-ipa-modref)
 # cp_verify prints.
 harden=(-D_GLIBCXX_ASSERTIONS -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection
   -ftrivial-auto-var-init=zero -fPIE -pie -Wl,-z,relro,-z,now,-z,noexecstack)
+# macOS: Apple's linker takes none of the ELF -z options, and every program there is position
+# independent already.
+if [[ $(uname -s) == Darwin ]]; then
+  harden=(-D_GLIBCXX_ASSERTIONS -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -fstack-protector-strong -ftrivial-auto-var-init=zero -fPIE)
+fi
 [[ $(uname -m) == x86_64 ]] && harden+=(-fcf-protection=full)
 "${cxx[@]}" "${harden[@]}" -std=c++17 -Wall -Wextra -Wuninitialized -Werror=unused-result \
   -Wno-misleading-indentation -pthread -I. -I../../blocks -I../../prover -DBLK_FIELD=$field -DBLK_COUNT_HASH_CALLS=1 -DSERVING_BUILD=1 -DDIGEST_WORDS=$dw -DVF_SOURCE_DIGEST="\"$build_word\"" -o "$work/cp_verify" \

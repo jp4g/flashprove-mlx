@@ -1138,8 +1138,13 @@ private:
     folder_is_taken = true;
     std::vector<std::string> names;
     {
+#ifdef __APPLE__
+      char path[1024];
+      if (fcntl(in, F_GETPATH, path)) path[0] = 0;
+#else
       char path[64];
       snprintf(path, sizeof path, "/proc/self/fd/%d", in);
+#endif
       std::string odd;
       if (!requests_in(path, names, odd))
         return fault("the folder named with -in cannot be read, or holds something that is no file <name>.req"), -1;
