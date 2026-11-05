@@ -1171,11 +1171,18 @@ def structure(fn, blocks, emit_block, cond_expr):
         elif x.term == 'br':
             branch(x, x.succ[0], ctx)
         else:
-            out.append(f'if({cond_expr(x.cond)}){{')
-            branch(x, x.succ[0], ctx)
-            out.append('}else{')
-            branch(x, x.succ[1], ctx)
+            # Every path of a branch ends in a jump or a return, so no `else` is needed. The nesting
+            # of brackets is limited (256): the arm that goes on stands outside the `if`.
+            c = cond_expr(x.cond)
+            a, b = x.succ
+            def is_jump(d):
+                return (x.id, d.id) in back or d.id in merge
+            if is_jump(b) and not is_jump(a):
+                a, b, c = b, a, f'!({c})'
+            out.append(f'if({c}){{')
+            branch(x, a, ctx)
             out.append('}')
+            branch(x, b, ctx)
 
     def do_tree(x, ctx):
         maxdepth[0] = max(maxdepth[0], len(ctx))

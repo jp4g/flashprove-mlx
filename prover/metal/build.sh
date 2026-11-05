@@ -13,7 +13,7 @@ out=build/metal/$form
 mkdir -p "$out"
 LLVM=${LLVM:-/opt/homebrew/opt/llvm}
 metal/build_runtime.sh build/metal
-flags=()
+flags=(-DMTL_BUILD=1)
 [[ $form == serving ]] && flags+=(-DSERVING_BUILD=1)
 fw=(-framework Metal -framework Foundation -framework Accelerate -Wl,-stack_size,0x4000000)
 keeper() {
@@ -48,7 +48,7 @@ commit() {
 case $what in
   link)
     clang++ -o "$out/cp_prove" "$out/cp_prove.o" "$out"/hf_keeper{,_2,_3}.o build/metal/libmetal_runtime.a "${fw[@]}"
-    clang++ -o "$out/cp_commit" "$out/cp_commit.o" "$out/cp_configured.o" build/metal/libmetal_runtime.a "${fw[@]}"
+    [[ -f $out/cp_commit.o ]] && clang++ -o "$out/cp_commit" "$out/cp_commit.o" "$out/cp_configured.o" build/metal/libmetal_runtime.a "${fw[@]}"
     ;;
   cp_prove) prove ;;
   cp_commit) commit ;;

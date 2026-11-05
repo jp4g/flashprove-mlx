@@ -127,7 +127,8 @@ int mtl_on_exit_add(mtl_exit_fn, void *);
 static inline int mtl_on_exit(mtl_exit_fn f, void *a) { return mtl_on_exit_add(f, a); }
 // exit(): remembers the status for the handlers, which read it.
 extern int mtl_exit_status;
-[[noreturn]] static inline void mtl_exit(int s) { mtl_exit_status = s; ::exit(s); }
+void mtl_on_exit_call(int s);
+[[noreturn]] static inline void mtl_exit(int s) { mtl_on_exit_call(s); mtl_exit_status = s; ::exit(s); }
 }
 #include <cstdlib>
 namespace std { using ::mtl_exit; }

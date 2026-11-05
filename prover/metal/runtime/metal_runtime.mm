@@ -31,6 +31,15 @@ extern const char mtl_prelude_text[];
 extern const char mtl_builtin_text[];
 
 bool verbose_now(); bool sync_each_now(); bool trace_now(); const char *dump_path();
+#include <stdarg.h>
+FILE *mtl_log_file();
+static void mlog(const char *f, ...) {
+  va_list a; va_start(a, f);
+  FILE *o = mtl_log_file();
+  vfprintf(o, f, a);
+  fflush(o);
+  va_end(a);
+}
 namespace {
 struct LaunchInfo {
   uint32_t gx, gy, gz, bx, by, bz, dyn, pad;
@@ -95,6 +104,7 @@ double compile_total_ms = 0;
 double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 [[noreturn]] void die(const char *what, const char *more = "") {
+  mlog("metal runtime: %s %s\n", what, more);
   fprintf(stderr, "metal runtime: %s %s\n", what, more);
   fflush(stderr);
   _exit(70);
@@ -173,6 +183,7 @@ void sync_all() {
     last_cb = nil;
   }
   if (control && control[0]) {
+    mlog("metal runtime: a kernel trapped\n");
     fprintf(stderr, "metal runtime: a kernel trapped\n");
     fflush(stderr);
     _exit(71);
@@ -232,14 +243,14 @@ id<MTLComputePipelineState> get_pso(Kernel *k, int on_device, unsigned threads) 
     die(k->name.c_str(), e.localizedDescription.UTF8String);
   }
   p = pipeline_of(l, @"K", 0);
-  if (trace_now()) fprintf(stderr, "  compile %.0f ms\n", now_ms() - t0);
+  if (trace_now()) mlog("  compile %.0f ms\n", now_ms() - t0);
   if (p.maxTotalThreadsPerThreadgroup < threads) p = pipeline_of(l, @"K", threads);
   if (p.maxTotalThreadsPerThreadgroup < threads) die("too many threads for", k->name.c_str());
   k->pso[on_device] = p;
   const double ms = now_ms() - t0;
   k->compile_ms += ms;
   compile_total_ms += ms;
-  if (verbose) fprintf(stderr, "metal runtime: compiled %s in %.0f ms (%zu bytes)\n", k->name.c_str(), ms, s.size());
+  if (verbose) mlog("metal runtime: compiled %s in %.0f ms (%zu bytes)\n", k->name.c_str(), ms, s.size());
   return p;
 }
 uint64_t get_scratch(uint64_t n) {
@@ -258,7 +269,7 @@ cudaError_t launch(const void *f, dim3 g, dim3 b, void **args, size_t dyn) {
   std::lock_guard<std::recursive_mutex> lock(big);
   Kernel *k = kernel_of(f);
   const uint64_t threads = (uint64_t)b.x * b.y * b.z, blocks = (uint64_t)g.x * g.y * g.z;
-  if (!threads || !blocks) return cudaErrorInvalidValue;
+  if (!threads || !blocks) { mlog("metal runtime: empty launch of %s\n", k->name.c_str()); return last_error = cudaErrorInvalidValue; }
   const uint64_t smem = (uint64_t)k->dyn_at + dyn;
   const int on_device = smem > 32768 ? 1 : 0;
   id<MTLComputePipelineState> p = get_pso(k, on_device, (unsigned)threads);
@@ -289,8 +300,8 @@ cudaError_t launch(const void *f, dim3 g, dim3 b, void **args, size_t dyn) {
   [enc dispatchThreadgroups:MTLSizeMake(g.x, g.y, g.z) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
   k->launches++;
   after_dispatch();
-  if (trace_now()) fprintf(stderr, "launch %s %u %u %u x %u %u %u dyn %zu\n", k->name.c_str(), g.x, g.y, g.z, b.x, b.y, b.z, dyn);
-  if (sync_each_now()) { const double t0 = now_ms(); sync_all(); if (trace_now()) fprintf(stderr, "  ran %.2f ms\n", now_ms() - t0); }
+  if (trace_now()) mlog("launch %s %u %u %u x %u %u %u dyn %zu\n", k->name.c_str(), g.x, g.y, g.z, b.x, b.y, b.z, dyn);
+  if (sync_each_now()) { const double t0 = now_ms(); sync_all(); if (trace_now()) mlog("  ran %.2f ms\n", now_ms() - t0); }
   return cudaSuccess;
 }
 } // namespace
@@ -301,7 +312,7 @@ int mtl_raw_alloc(void **out, size_t n) {
   n = (n + 16383) & ~(size_t)16383;
   id<MTLBuffer> b = [dev newBufferWithLength:n options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
   if (!b) {
-    if (verbose) fprintf(stderr, "metal runtime: no buffer of %zu bytes (in use: %zu)\n", n, used_bytes);
+    if (verbose) mlog("metal runtime: no buffer of %zu bytes (in use: %zu)\n", n, used_bytes);
     return 1;
   }
   mach_vm_address_t target = b.gpuAddress;
@@ -354,7 +365,7 @@ static cudaError_t release(void *p) {
     return cudaSuccess;
   }
   auto it = allocs.find((uint64_t)p);
-  if (it == allocs.end()) return cudaErrorInvalidValue;
+  if (it == allocs.end()) { mlog("metal runtime: free of unknown %p\n", p); return cudaErrorInvalidValue; }
   mach_vm_deallocate(mach_task_self(), it->first, it->second.size);
   [resident removeAllocation:it->second.buf];
   [resident commit];
@@ -369,7 +380,17 @@ static std::vector<std::pair<mtl_exit_fn, void *>> &exit_list_() { static auto *
 #define exit_list exit_list_()
 int mtl_exit_status = 0;
 int mtl_second_start = 0;
+#include <execinfo.h>
+void mtl_on_exit_call(int s) {
+  if (!s || !trace_now()) return;
+  void *f[40];
+  const int n = backtrace(f, 40);
+  char **names = backtrace_symbols(f, n);
+  for (int i = 0; i < n; i++) mlog("%s\n", names[i]);
+}
 static bool env_verbose, env_sync_each, env_trace;
+static FILE *log_file;
+FILE *mtl_log_file() { return log_file ? log_file : stderr; }
 static std::string *env_dump;
 __attribute__((constructor)) static void see_second_start() {
   if (getenv("MTL_SECOND_START")) mtl_second_start = 1;
@@ -377,6 +398,7 @@ __attribute__((constructor)) static void see_second_start() {
   env_sync_each = getenv("MTL_SYNC_EACH");
   env_trace = getenv("MTL_TRACE");
   if (const char *d = getenv("MTL_DUMP")) env_dump = new std::string(d);
+  if (const char *d = getenv("MTL_LOG")) log_file = fopen(d, "a");
 }
 bool verbose_now() { return env_verbose; }
 bool sync_each_now() { return env_sync_each; }
@@ -453,11 +475,43 @@ cudaError_t cudaMallocHost(void **p, size_t n) { return alloc(p, n); }
 cudaError_t cudaMallocManaged(void **p, size_t n, unsigned) { return alloc(p, n); }
 cudaError_t cudaMallocPitch(void **p, size_t *pitch, size_t w, size_t h) { *pitch = (w + 255) & ~(size_t)255; return alloc(p, *pitch * h); }
 cudaError_t cudaHostAlloc(void **p, size_t n, unsigned) { return alloc(p, n); }
-cudaError_t cudaHostRegister(void *, size_t, unsigned) { return cudaSuccess; }
-cudaError_t cudaHostUnregister(void *) { return cudaSuccess; }
+// Host memory that kernels are to read: a buffer without a copy over its pages. The GPU reaches it at
+// another address, which cudaHostGetDevicePointer gives.
+struct Registered { uint64_t host, gpu; size_t size; id<MTLBuffer> buf; };
+static std::vector<Registered> &registered() { static auto *v = new std::vector<Registered>; return *v; }
+cudaError_t cudaHostRegister(void *p, size_t n, unsigned) {
+  start();
+  std::lock_guard<std::recursive_mutex> g(big);
+  if (is_ours(p)) return cudaSuccess;
+  const uint64_t page = 16384, a = (uint64_t)p & ~(page - 1), e = ((uint64_t)p + n + page - 1) & ~(page - 1);
+  id<MTLBuffer> b = [dev newBufferWithBytesNoCopy:(void *)a length:e - a options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked deallocator:nil];
+  if (!b) { mlog("metal runtime: cudaHostRegister of %zu bytes failed\n", n); return last_error = cudaErrorInvalidValue; }
+  [resident addAllocation:b];
+  [resident commit];
+  registered().push_back({a, b.gpuAddress, e - a, b});
+  return cudaSuccess;
+}
+cudaError_t cudaHostUnregister(void *p) {
+  std::lock_guard<std::recursive_mutex> g(big);
+  sync_all();
+  auto &r = registered();
+  for (size_t i = 0; i < r.size(); i++)
+    if ((uint64_t)p >= r[i].host && (uint64_t)p < r[i].host + r[i].size) {
+      [resident removeAllocation:r[i].buf];
+      [resident commit];
+      r.erase(r.begin() + i);
+      break;
+    }
+  return cudaSuccess;
+}
 cudaError_t cudaHostGetDevicePointer(void **d, void *h, unsigned) {
   std::lock_guard<std::recursive_mutex> g(big);
-  if (!is_ours(h)) return last_error = cudaErrorInvalidValue;
+  if (!is_ours(h)) {
+    for (auto &r : registered())
+      if ((uint64_t)h >= r.host && (uint64_t)h < r.host + r.size) { *d = (void *)(r.gpu + ((uint64_t)h - r.host)); return cudaSuccess; }
+    mlog("metal runtime: cudaHostGetDevicePointer of foreign memory\n");
+    return last_error = cudaErrorInvalidValue;
+  }
   *d = h;
   return cudaSuccess;
 }
@@ -627,12 +681,30 @@ void __cudaRegisterManagedVar(void **, void **, char *, const char *, int, size_
 // ---- the driver API
 CUresult cuGetErrorString(CUresult, const char **s) { *s = "error"; return 0; }
 CUresult cuEventElapsedTime(float *ms, CUevent a, CUevent b) { return cudaEventElapsedTime(ms, a, b); }
-CUresult cuMemAddressReserve(CUdeviceptr *p, size_t n, size_t, CUdeviceptr, unsigned long long) { void *q = nullptr; const cudaError_t e = alloc(&q, n); *p = (CUdeviceptr)q; return e; }
-CUresult cuMemAddressFree(CUdeviceptr p, size_t) { return release((void *)p); }
+// A range of addresses is one buffer whose pages cost nothing until touched: a buffer has a limit, and
+// a range is cut to it. What cuMemMap maps counts as used.
+CUresult cuMemAddressReserve(CUdeviceptr *p, size_t n, size_t, CUdeviceptr, unsigned long long) {
+  start();
+  std::lock_guard<std::recursive_mutex> g(big);
+  void *q = nullptr;
+  // All of a buffer counts toward what the GPU may keep resident, touched or not.
+  const char *gb = getenv("MTL_RESERVE_GB");
+  const size_t cap = (size_t)(gb ? atoi(gb) : 12) << 30, was = used_bytes;
+  const int e = mtl_raw_alloc(&q, std::min(n, cap));
+  used_bytes = was;
+  *p = (CUdeviceptr)q;
+  return e;
+}
+CUresult cuMemAddressFree(CUdeviceptr p, size_t) {
+  std::lock_guard<std::recursive_mutex> g(big);
+  auto it = allocs.find(p);
+  if (it != allocs.end()) used_bytes += it->second.size; // it was never counted
+  return release((void *)p);
+}
 CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t, const CUmemAllocationProp *, unsigned long long) { *h = 1; return 0; }
 CUresult cuMemRelease(CUmemGenericAllocationHandle) { return 0; }
-CUresult cuMemMap(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long) { return 0; }
-CUresult cuMemUnmap(CUdeviceptr, size_t) { return 0; }
+CUresult cuMemMap(CUdeviceptr, size_t n, size_t, CUmemGenericAllocationHandle, unsigned long long) { used_bytes += n; peak_bytes = std::max(peak_bytes, used_bytes); return 0; }
+CUresult cuMemUnmap(CUdeviceptr, size_t n) { used_bytes -= n; return 0; }
 CUresult cuMemSetAccess(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t) { return 0; }
 CUresult cuMemGetAllocationGranularity(size_t *g, const CUmemAllocationProp *, int) { *g = 2u << 20; return 0; }
 // ---- integer products
