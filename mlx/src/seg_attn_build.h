@@ -157,7 +157,27 @@ inline void attn_calls(const Policy &p, AttnGroup &R) {
     K.keys.assign(1ull << K.n, K.row(K.t0)), K.padding.assign(1ull << K.n, 1);
   }
 }
-inline AttnGroup attn_build(const Policy &pol, const ModelShape &m, FFGroup &ff, int g) {
+// The lookup's sizes, multiplicities and planes, from the keys.
+inline AttnGroup attn_finish(AttnGroup &R) {
+  const AShape &s = R.s;
+  R.sizes = lookup_sizes(R.calls, (unsigned)s.lidb);
+  R.keys_ok = lookup_multiplicities(R.calls, R.sizes, R.mult);
+  const unsigned kT = R.sizes.kT;
+  R.bA = CellMatrix2(1ull << s.lmbA, (u64)R.sizes.NC << (kT + 5 - s.lmbA));
+  if (R.keys_ok)
+    for (unsigned c = 0; c < R.sizes.NC; c++)
+      for (u64 t = 0; t < (1ull << kT); t++)
+        for (u64 j = 0; j < 32; j++)
+          if ((R.mult[c][t] >> j) & 1) {
+            const u64 S = (((u64)c << kT) + t) * 32 + j;
+            R.bA.at(S & ((1ull << s.lmbA) - 1), S >> s.lmbA) = 1;
+          }
+  return std::move(R);
+}
+inline void attn_fill_gpu(AttnGroup &R, const Values &V, const std::array<std::map<u64, std::pair<size_t, u64>>, 7> &at);
+// V given: the values come from the forward pass and the witness is made on Metal. Without it: on the host,
+// from the cells of qa; attn_keys_test compares the two.
+inline AttnGroup attn_build(const Policy &pol, const ModelShape &m, FFGroup &ff, int g, const Values *fromV = nullptr) {
   AttnGroup R;
   R.s = attn_shape(pol, m, g);
   R.g = g;
@@ -175,6 +195,7 @@ inline AttnGroup attn_build(const Policy &pol, const ModelShape &m, FFGroup &ff,
     const auto &[q, off] = at[seg].at(lam * HA + a);
     R.calls[q].keys[off + n] = v, R.calls[q].padding[off + n] = 0;
   };
+  if (fromV) { attn_fill_gpu(R, *fromV, at); return attn_finish(R); }
   // Values, from the cells of qa.
   auto read = [&](const char *name, u64 lam, u64 f, u64 t) {
     const Tensor2 &X = ff.tf.at(name);
@@ -268,18 +289,106 @@ inline AttnGroup attn_build(const Policy &pol, const ModelShape &m, FFGroup &ff,
           }
     }
   }
-  R.sizes = lookup_sizes(R.calls, (unsigned)s.lidb);
-  R.keys_ok = lookup_multiplicities(R.calls, R.sizes, R.mult);
-  const unsigned kT = R.sizes.kT;
-  R.bA = CellMatrix2(1ull << s.lmbA, (u64)R.sizes.NC << (kT + 5 - s.lmbA));
-  if (R.keys_ok)
-    for (unsigned c = 0; c < R.sizes.NC; c++)
-      for (u64 t = 0; t < (1ull << kT); t++)
-        for (u64 j = 0; j < 32; j++)
-          if ((R.mult[c][t] >> j) & 1) {
-            const u64 S = (((u64)c << kT) + t) * 32 + j;
-            R.bA.at(S & ((1ull << s.lmbA) - 1), S >> s.lmbA) = 1;
-          }
-  return R;
+  return attn_finish(R);
+}
+inline void attn_fill_gpu(AttnGroup &R, const Values &V, const std::array<std::map<u64, std::pair<size_t, u64>>, 7> &at) {
+  const AShape &s = R.s;
+  const u64 T = s.T, Bt = s.Bt, nT = s.nT, hP = s.hP, H = s.H, HA = s.HA, dh = s.dh, dq = s.dq, dkv = s.dkv, Lam = s.Lam, NH = Lam * H;
+  // Keys: their padding's values are already in place.
+  std::vector<u64> base(R.calls.size());
+  u64 nk = 0;
+  for (size_t c = 0; c < R.calls.size(); c++) base[c] = nk, nk += u64(1) << R.calls[c].n;
+  mx::array keys = w_buffer(nk * 8, mx::uint64, 0), pad = w_buffer(nk, mx::uint8, 1);
+  for (size_t c = 0; c < R.calls.size(); c++) memcpy(keys.data<uint64_t>() + base[c], R.calls[c].keys.data(), R.calls[c].keys.size() * 8);
+  const u64 nseg = Lam * HA;
+  std::vector<u64> kb(7 * nseg, 0);
+  for (int q = 0; q < 7; q++) for (auto &[where, x] : at[q]) kb[q * nseg + where] = base[x.first] + x.second;
+  mx::array as = w_buffer(s.NAs * R.as[0].cell.size() * 4, mx::int32, 0);
+  mx::array ah = w_buffer(R.ah.part[0].cell.size() * 4, mx::int32, 0), ao = w_buffer(R.ao.part[0].cell.size() * 4, mx::int32, 0);
+  mx::array sc = w_buffer(NH * T * T * 8, mx::int64, 0), acc = w_buffer(NH * T * dh * 8, mx::int64, 0), rem = w_buffer(NH * T * dh * 8, mx::int64, 0), mzi = w_buffer(3 * NH * T * 8, mx::int64, 0);
+  std::vector<u64> P(AP_COUNT, 0);
+  P[AP_T] = T, P[AP_BT] = Bt, P[AP_NT] = nT, P[AP_HP] = hP, P[AP_H] = H, P[AP_HA] = HA, P[AP_DH] = dh, P[AP_DQ] = dq, P[AP_DKV] = dkv, P[AP_LAMS] = Lam, P[AP_G] = s.G, P[AP_LT] = s.lt, P[AP_LDH] = s.ldh;
+  P[AP_NM] = s.nM, P[AP_ND] = s.nD, P[AP_NP] = s.NP, P[AP_LMS] = s.lmS, P[AP_KPART] = s.kPart, P[AP_NSEG] = nseg, P[AP_AHK] = R.ah.k, P[AP_AHFR] = R.ah.fr, P[AP_AOK] = R.ao.k, P[AP_AOFR] = R.ao.fr;
+  P[AP_OZR] = s.oZr, P[AP_OIB] = s.oIb, P[AP_ORHP] = s.oRhp, P[AP_U0] = s.u0;
+  const mx::array kbA = w_table(kb), ttA = w_table(s.Tt);
+  std::vector<mx::array> done;
+  auto L = [&](const char *n, u64 lam) { return std::string(n) + "." + std::to_string((u64)R.g * Lam + lam); };
+  const std::vector<std::string> names1{"as_", "ah", "ao", "keys", "padf", "kb", "tt", "sc", "acc", "rem", "mzi", "Q", "K", "Vv", "O", "p"};
+  for (u64 lam = 0; lam < Lam; lam++) {
+    const AShape::ShD D = s.shd(s.sh[lam]);
+    P[AP_LAM] = lam, P[AP_SH] = s.sh[lam], P[AP_C] = D.C, P[AP_RHO] = D.rho, P[AP_OM] = D.Om;
+    const mx::array Pa = w_table(P);
+    const mx::array one = run_kernel("fp_a_rows", R"(
+      ulong i = thread_position_in_grid.x, h = thread_position_in_grid.y, T = p[AP_T], H = p[AP_H], HA = p[AP_HA], dh = p[AP_DH], dq = p[AP_DQ], dkv = p[AP_DKV], lam = p[AP_LAM], Lam = p[AP_LAMS], lt = p[AP_LT], sh = p[AP_SH], C = p[AP_C], G = p[AP_G], ldh = p[AP_LDH];
+      ulong hk = h / HA, a = h % HA, bi = lam * H + h;
+      device long *scr = (device long *)sc + (bi * T + i) * T, *ac = (device long *)acc + (bi * T + i) * dh, *re = (device long *)rem + (bi * T + i) * dh, *m3 = (device long *)mzi;
+      device int *AH = (device int *)ah, *AO = (device int *)ao; device ulong *KY = (device ulong *)keys; device uchar *PD = (device uchar *)padf;
+      for (ulong j = 0; j < T; j++) { long t = 0; for (ulong c = 0; c < dh; c++) t += Q[i * dq + h * dh + c] * K[j * dkv + hk * dh + c]; scr[j] = t; }
+      ulong best = 0;
+      for (ulong j = 1; j <= i; j++) if (scr[j] > scr[best]) best = j;
+      long Mx = scr[best], Zd = 0;
+      for (ulong j = 0; j <= i; j++) {
+        long Df = Mx - scr[j];
+        if (Df >= (long)C) continue;
+        long e = (long)tt[(ulong)Df >> sh];
+        Zd += e;
+        for (ulong c = 0; c < dh; c++) ac[c] += e * Vv[j * dkv + hk * dh + c];
+      }
+      m3[(0 * Lam * H + bi) * T + i] = Mx, m3[(1 * Lam * H + bi) * T + i] = Zd, m3[(2 * Lam * H + bi) * T + i] = (long)best;
+      ulong rows = T * p[AP_AHFR], k = p[AP_AHK], fr = p[AP_AHFR];
+      f_put(AH, k, fr, rows, T, lam * H + h, Lam * H, 4, i, Mx);
+      f_put(AH, k, fr, rows, T, p[AP_OZR] + lam * H + h, Lam * H, 4, i, Zd);
+      for (ulong b = 0; b < lt; b++) f_cell(AH, k, fr, rows, T, p[AP_OIB] + lam * lt * H + b * H + h, i, (int)((best >> b) & 1));
+      a_key(KY, PD, kb, p, A_IX, lam, a, (hk << lt) + i, (ulong)(i - best) << (16 - lt));
+      ulong k2 = p[AP_AOK], fr2 = p[AP_AOFR], rows2 = T * fr2;
+      for (ulong c = 0; c < dh; c++) {
+        long r = 2 * ac[c] + Zd - 2 * Zd * O[i * dq + h * dh + c], r2 = 2 * Zd - 1 - r, rhv = (r >> 16) - 128, rpv = (r2 >> 16) - 128;
+        re[c] = r;
+        f_cell(AO, k2, fr2, rows2, T, lam * dq + h * dh + c, i, (int)rhv);
+        f_cell(AO, k2, fr2, rows2, T, p[AP_ORHP] + lam * dq + h * dh + c, i, (int)rpv);
+        ulong ix = ((hk << lt) + i) * dh + c;
+        a_key(KY, PD, kb, p, A_WL, lam, a, ix, (ulong)(r - 65536 * (rhv + 128)));
+        a_key(KY, PD, kb, p, A_WL, lam, a, (G << (lt + ldh)) + ix, (ulong)(r2 - 65536 * (rpv + 128)));
+        a_key(KY, PD, kb, p, A_WH, lam, a, ix, (ulong)(rhv + 128) + ((ulong)(rpv + 128) << 20));
+      })", {as, ah, ao, keys, pad, kbA, ttA, sc, acc, rem, mzi, V.g.at(L("q", lam)), V.g.at(L("k", lam)), V.g.at(L("v", lam)), V.g.at(L("o", lam)), Pa}, names1, {{1}}, T, H)[0];
+    done.push_back(one);
+    const std::vector<std::string> names2{"as_", "keys", "padf", "kb", "tt", "sc", "mzi", "dep", "p"};
+    done.push_back(run_kernel("fp_a_regionM", R"(
+      ulong x = thread_position_in_grid.x, h = thread_position_in_grid.y, T = p[AP_T], Bt = p[AP_BT], nT = p[AP_NT], hP = p[AP_HP], H = p[AP_H], HA = p[AP_HA], lam = p[AP_LAM], Lam = p[AP_LAMS];
+      ulong hk = h / HA, a = h % HA, bi = lam * H + h, jl = x % Bt, il = (x / Bt) % Bt, sg = (x / (Bt * Bt)) % nT, P = x / (Bt * Bt * nT);
+      ulong I = 0, J = 0;
+      if (sg + 1 < nT) { if (sg < P) I = P, J = sg; else I = nT - 1 - P, J = sg - P; }
+      ulong n = ((((hk * hP + P) * nT + sg) * Bt + il) * Bt) + jl, i = I * Bt + il, j = J * Bt + jl;
+      long Df = sg + 1 < nT ? mzi[bi * T + i] - sc[(bi * T + i) * T + j] : (long)p[AP_C];
+      a_pair((device int *)as_, (device ulong *)keys, (device uchar *)padf, kb, tt, p, lam, a, false, n, Df);)",
+      {as, keys, pad, kbA, ttA, sc, mzi, one, Pa}, names2, {{1}}, hP * nT * Bt * Bt, H)[0]);
+    done.push_back(run_kernel("fp_a_regionD", R"(
+      ulong x = thread_position_in_grid.x, h = thread_position_in_grid.y, T = p[AP_T], Bt = p[AP_BT], nT = p[AP_NT], H = p[AP_H], HA = p[AP_HA], lam = p[AP_LAM];
+      ulong hk = h / HA, a = h % HA, bi = lam * H + h, jl = x % Bt, il = (x / Bt) % Bt, I = x / (Bt * Bt);
+      ulong n = (((hk * nT + I) * Bt + il) * Bt) + jl, i = I * Bt + il, j = I * Bt + jl;
+      long Df = mzi[bi * T + i] - sc[(bi * T + i) * T + j] + (jl > il ? (long)p[AP_OM] : 0);
+      a_pair((device int *)as_, (device ulong *)keys, (device uchar *)padf, kb, tt, p, lam, a, true, n, Df);)",
+      {as, keys, pad, kbA, ttA, sc, mzi, one, Pa}, names2, {{1}}, nT * Bt * Bt, H)[0]);
+  }
+  mx::eval(done);
+  { const int32_t *c = as.data<int32_t>(); for (CellMatrix2 &x : R.as) memcpy(x.cell.data(), c, x.cell.size() * 4), c += x.cell.size(); }
+  memcpy(R.ah.part[0].cell.data(), ah.data<int32_t>(), R.ah.part[0].cell.size() * 4);
+  memcpy(R.ao.part[0].cell.data(), ao.data<int32_t>(), R.ao.part[0].cell.size() * 4);
+  for (size_t c = 0; c < R.calls.size(); c++) {
+    memcpy(R.calls[c].keys.data(), keys.data<uint64_t>() + base[c], R.calls[c].keys.size() * 8);
+    memcpy(R.calls[c].padding.data(), pad.data<uint8_t>() + base[c], R.calls[c].padding.size());
+  }
+  R.Q.resize(Lam), R.K.resize(Lam), R.Vv.resize(Lam), R.O.resize(Lam);
+  for (u64 lam = 0; lam < Lam; lam++) R.Q[lam] = V.at(L("q", lam)), R.K[lam] = V.at(L("k", lam)), R.Vv[lam] = V.at(L("v", lam)), R.O[lam] = V.at(L("o", lam));
+  R.Mx.resize(NH), R.Zd.resize(NH), R.ib.resize(NH), R.sc.resize(NH), R.acc.resize(NH), R.rem.resize(NH);
+  const int64_t *m3 = mzi.data<int64_t>();
+  for (u64 b = 0; b < NH; b++) {
+    R.Mx[b].assign(m3 + b * T, m3 + (b + 1) * T);
+    R.Zd[b].assign(m3 + (NH + b) * T, m3 + (NH + b + 1) * T);
+    R.ib[b].assign(m3 + (2 * NH + b) * T, m3 + (2 * NH + b + 1) * T);
+    R.sc[b].assign(sc.data<int64_t>() + b * T * T, sc.data<int64_t>() + (b + 1) * T * T);
+    R.acc[b].assign(acc.data<int64_t>() + b * T * dh, acc.data<int64_t>() + (b + 1) * T * dh);
+    R.rem[b].assign(rem.data<int64_t>() + b * T * dh, rem.data<int64_t>() + (b + 1) * T * dh);
+  }
 }
 }

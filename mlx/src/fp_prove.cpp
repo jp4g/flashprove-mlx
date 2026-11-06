@@ -185,7 +185,7 @@ int main(int argc, char **argv) {
       printf("G%d: %.1f s, %u scalars, %zu bytes so far\n", g, now() - ts, slot, file.size());
       // The attention segment.
       ts = now();
-      AttnGroup A = attn_build(pol, shape, G, g);
+      AttnGroup A = attn_build(pol, shape, G, g, &V);
       if (!A.keys_ok) { fprintf(stderr, "fp_prove: a key of attention is in no row\n"); return 3; }
       SegMask am = make_mask(P, sh, la);
       Arrays arrays = named(attn_arrays(A));

@@ -110,3 +110,44 @@ inline void w_norm_row(const device long *x, ulong d, long eps, uint M, device l
   for (int j = 0; j < 99; j++) o[WN_D + j] = D[j];
   for (int s = 0; s < 9; s++) o[WN_W + s] = Wq[s];
 }
+// A cell of a matrix of features, in general: k columns, fr = rows / T per feature, `rows` in a part.
+inline void f_cell(device int *c, ulong k, ulong fr, ulong rows, ulong T, ulong ft, ulong t, int v) {
+  const ulong kf = k * fr;
+  c[(ft / kf) * rows * k + ((ft % fr) * T + t) * k + (ft / fr) % k] = v;
+}
+inline void f_put(device int *c, ulong k, ulong fr, ulong rows, ulong T, ulong f0, ulong stride, ulong nl, ulong t, long v) {
+  for (ulong lb = 0; lb < nl; lb++) {
+    int x;
+    if (lb + 1 == nl) x = (int)v;
+    else { const long y = ((v + 128) & 255) - 128; x = (int)y; v = (v - y) >> 8; }
+    f_cell(c, k, fr, rows, T, f0 + lb * stride, t, x);
+  }
+}
+// Attention: the cell of plane x of the pair n of (lam, a), and a key.
+inline void a_plane(device int *as, const device ulong *p, ulong x, ulong lam, ulong a, bool isD, ulong n, int v) {
+  const ulong nM = p[AP_NM], nD = p[AP_ND], Lam = p[AP_LAMS], HA = p[AP_HA], NP = p[AP_NP], lmS = p[AP_LMS], kP = p[AP_KPART];
+  const ulong u = (x * Lam + lam) * HA + a, N = isD ? ((5 * NP) << nM) + (u << nD) + n : (u << nM) + n;
+  const ulong col = N >> lmS, rows = 1ul << lmS;
+  as[(col / kP) * rows * kP + (N & (rows - 1)) * kP + col % kP] = v;
+}
+inline void a_key(device ulong *keys, device uchar *pad, const device ulong *kb, const device ulong *p, uint seg, ulong lam, ulong a, ulong n, ulong v) {
+  const ulong idx = kb[(ulong)seg * p[AP_NSEG] + lam * p[AP_HA] + a] + n;
+  keys[idx] = v, pad[idx] = 0;
+}
+inline void a_pair(device int *as, device ulong *keys, device uchar *pad, const device ulong *kb, const device ulong *tt, const device ulong *p, ulong lam, ulong a, bool isD, ulong n, long Df) {
+  const ulong sh = p[AP_SH], C = p[AP_C], rho = p[AP_RHO];
+  ulong rm, fl, ew;
+  if (Df < (long)C) rm = (ulong)Df & ((1ul << sh) - 1), fl = 0, ew = tt[(ulong)Df >> sh];
+  else rm = (1ul << sh) + ((ulong)Df - C) % rho, fl = 1, ew = 0;
+  a_plane(as, p, 0, lam, a, isD, n, (int)(rm & 255) - 128);
+  a_plane(as, p, 1, lam, a, isD, n, (int)(rm >> 8) - 128);
+  a_plane(as, p, 2, lam, a, isD, n, (int)fl);
+  a_plane(as, p, 3, lam, a, isD, n, (int)(ew & 255) - 128);
+  a_plane(as, p, 4, lam, a, isD, n, (int)(ew >> 8));
+  a_key(keys, pad, kb, p, isD ? A_RD : A_RM, lam, a, n, (rm & 255) + ((rm >> 8) << 20) + (fl << 40));
+  a_key(keys, pad, kb, p, isD ? A_FD : A_FM, lam, a, n, (ulong)(Df - (long)rm) + (fl << 32) + (ew << 33));
+}
+inline void h_key(device ulong *keys, device uchar *pad, const device ulong *kd, const device uint *pos, uint seg, ulong x, ulong t, ulong T, ulong key, bool padding) {
+  const ulong idx = kd[2 * seg] + (ulong)pos[kd[2 * seg + 1] + x] * T + t;
+  keys[idx] = key, pad[idx] = padding ? 1 : 0;
+}

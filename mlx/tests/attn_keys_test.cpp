@@ -259,6 +259,23 @@ int main(int c, char **v) {
   for (int g = 0; g < groups; g++) {
     FFGroup F = ff_build(pol, m, V, tabs, g);
     AttnGroup A = attn_build(pol, m, F, g);
+    { // The GPU's witness against the host's, word by word.
+      const AttnGroup B = attn_build(pol, m, F, g, &V);
+      size_t diff = 0, n = 0;
+      auto cmp = [&](const std::vector<int32_t> &x, const std::vector<int32_t> &y) { n += x.size(); for (size_t i = 0; i < x.size(); i++) diff += x[i] != y[i]; };
+      for (size_t i = 0; i < A.as.size(); i++) cmp(A.as[i].cell, B.as[i].cell);
+      cmp(A.ah.part[0].cell, B.ah.part[0].cell), cmp(A.ao.part[0].cell, B.ao.part[0].cell), cmp(A.bA.cell, B.bA.cell);
+      printf("group %d: %zu of %zu cells differ\n", g, diff, n);
+      size_t dk = 0, nk = 0;
+      for (size_t c = 0; c < A.calls.size(); c++) {
+        nk += A.calls[c].keys.size();
+        for (size_t i = 0; i < A.calls[c].keys.size(); i++) dk += A.calls[c].keys[i] != B.calls[c].keys[i] || A.calls[c].padding[i] != B.calls[c].padding[i];
+      }
+      printf("group %d: %zu of %zu keys differ\n", g, dk, nk);
+      const bool same = A.Q == B.Q && A.K == B.K && A.Vv == B.Vv && A.O == B.O && A.Mx == B.Mx && A.Zd == B.Zd && A.ib == B.ib && A.sc == B.sc && A.acc == B.acc && A.rem == B.rem && A.mult == B.mult;
+      printf("group %d: the values are %s\n", g, same ? "equal" : "NOT EQUAL");
+      if (diff || dk || !same) return 1;
+    }
     for (size_t i = 0; i < A.calls.size(); i++) {
       std::vector<LookupCall> one{A.calls[i]};
       LookupSizes sz = lookup_sizes(one, (unsigned)A.s.lidb);
