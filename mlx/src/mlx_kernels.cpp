@@ -35,7 +35,7 @@ std::string read_kernel_header(const char *name) {
     if (l.rfind("#pragma once", 0)) out += l + "\n";
   return out;
 }
-static const char *HEADERS[] = {"field.h.metal", "blake2b.h.metal", "sumcheck.h.metal", "chacha.h.metal"};
+static const char *HEADERS[] = {"field.h.metal", "blake2b.h.metal", "sumcheck.h.metal", "chacha.h.metal", "witness_ids.h", "witness.h.metal"};
 static std::string all_headers() { std::string h; for (const char *f : HEADERS) h += read_kernel_header(f); return h; }
 // One kernel by name, made once. n threads, in groups of up to 256.
 static std::vector<mx::array> run(const std::string &name, const std::string &body, const std::vector<mx::array> &in, const std::vector<std::string> &names,
@@ -45,6 +45,10 @@ static std::vector<mx::array> run(const std::string &name, const std::string &bo
   if (it == kernels.end()) it = kernels.emplace(name, mx::fast::metal_kernel(name, names, outs, body, all_headers())).first;
   BLK_REQUIRE(threads < (1ull << 31), "mlx: too many threads for one kernel");
   return it->second(in, shapes, std::vector<mx::Dtype>(shapes.size(), mx::uint64), {(int)threads, (int)rows, 1}, {(int)std::min<size_t>(threads, 256), 1, 1}, {}, std::nullopt, false, {});
+}
+std::vector<mx::array> run_kernel(const std::string &name, const std::string &body, const std::vector<mx::array> &in, const std::vector<std::string> &names,
+                                  const std::vector<mx::Shape> &shapes, size_t threads, size_t rows) {
+  return run(name, body, in, names, shapes, threads, rows);
 }
 static mx::array words(const std::vector<blk::u64> &v) { return mx::array(reinterpret_cast<const uint64_t *>(v.data()), {(int)v.size()}, mx::uint64); }
 static mx::array words(const blk::u64 *v, size_t n) { return mx::array(reinterpret_cast<const uint64_t *>(v), {(int)n}, mx::uint64); }

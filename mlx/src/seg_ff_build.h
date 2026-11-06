@@ -3,6 +3,7 @@
 // Fills the matrices of the feed-forward segment of group g, and forms the keys of its lookup.
 #pragma once
 #include "seg_ff_witness.h"
+#include "ff_witness_gpu.h"
 namespace fpmlx {
 struct FFGroup {
   FFShape s;
@@ -35,7 +36,8 @@ struct PutTo {
   const Tensor2 &t;
   void put(int ix, int j, int tok, I64 v) { int32_t c[8]; limbs_of(v, t.nl, c); for (int lb = 0; lb < t.nl; lb++) m.cell(t.feat(lb, ix, j), tok) = c[lb]; }
 };
-inline FFGroup ff_build(const Policy &pol, const ModelShape &m, const Values &V, const CallTables &tabs, int g) {
+inline void ff_fill_gpu(FFGroup &R, const Policy &pol, const ModelShape &m, const Values &V, int g);
+inline FFGroup ff_build(const Policy &pol, const ModelShape &m, const Values &V, const CallTables &tabs, int g, bool on_gpu = true) {
   FFGroup R;
   R.s = ff_shape(pol, m);
   R.g = g;
@@ -117,6 +119,7 @@ inline FFGroup ff_build(const Policy &pol, const ModelShape &m, const Values &V,
     else if (kind == "FS") K.table = tabs.FS, K.t0 = 32768;
     K.keys.assign(1ull << K.n, 0), K.padding.assign(1ull << K.n, 1);
   }
+  if (on_gpu) { ff_fill_gpu(R, pol, m, V, g); return R; }
   auto key_put = [&](const std::string &seg, int lam, u64 x, int t, u64 key) {
     for (size_t c = 0; c < pol.call.size(); c++) {
       auto it = R.place[c].find(seg);
@@ -274,5 +277,229 @@ inline FFGroup ff_build(const Policy &pol, const ModelShape &m, const Values &V,
     }
   }
   return R;
+}
+// The kernels' bodies: the host's loops of ff_build(), one thread for each (x, token).
+inline void ff_fill_gpu(FFGroup &R, const Policy &pol, const ModelShape &m, const Values &V, int g) {
+  const FFShape &s = R.s;
+  const int Lam = s.Lam, T = s.T, d = s.d, NE = s.NE;
+  // Matrices.
+  FeatMat *mats[WM_COUNT] = {&R.af, &R.ad, &R.ar, &R.qa, &R.xbI, &R.xbO};
+  std::vector<u64> md;
+  WitnessRun W;
+  for (FeatMat *f : mats) {
+    md.push_back(f->k), md.push_back(f->fr), md.push_back(f->part[0].m);
+    W.common.push_back(w_buffer(f->part.size() * f->part[0].cell.size() * 4, mx::int32, 0));
+  }
+  // Tensors.
+  std::vector<u64> td(5 * WT_COUNT, 0);
+  auto tensor = [&](int id, const char *n, int mat) {
+    auto it = R.tf.find(n);
+    if (it == R.tf.end()) return;
+    const Tensor2 &t = it->second;
+    u64 *x = &td[5 * id];
+    x[0] = t.off, x[1] = t.nl, x[2] = t.cnt, x[3] = t.J, x[4] = mat;
+  };
+  const std::pair<const char *, int> AFt[] = {{"gi", WT_GI}, {"g0", WT_G0}, {"gc", WT_GC}, {"gh", WT_GH}, {"sl", WT_SL}, {"up", WT_UP}, {"rg", WT_RG}, {"ru", WT_RU}, {"xs", WT_XS}, {"ro", WT_RO}, {"rd", WT_RD},
+                                              {"aw", WT_AW}, {"ra", WT_RA}, {"mw", WT_MW}, {"rm", WT_RM}, {"qkw", WT_QKW}, {"rqk", WT_RQK}, {"vw", WT_VW}, {"rv", WT_RV}};
+  for (auto &[n, id] : AFt) tensor(id, n, WM_AF);
+  tensor(WT_AN, "an", WM_AD), tensor(WT_MN, "mn", WM_AD), tensor(WT_XR, "xr", WM_AD);
+  const std::pair<const char *, int> ARt[] = {{"lr", WT_LR}, {"rl", WT_RL}, {"sel", WT_SEL}, {"sc", WT_SC}, {"row", WT_ROW}, {"ly", WT_LY}, {"l3", WT_L3}};
+  for (auto &[n, id] : ARt) tensor(id, n, WM_AR);
+  tensor(WT_Q, "q", WM_QA), tensor(WT_KX, "kx", WM_QA), tensor(WT_V, "v", WM_QA), tensor(WT_O, "o", WM_QA);
+  { u64 *x = &td[5 * WT_XBI]; x[0] = 0, x[1] = s.XL, x[2] = 1, x[3] = d, x[4] = WM_XI; }
+  { u64 *x = &td[5 * WT_XBO]; x[0] = 0, x[1] = s.XL, x[2] = 1, x[3] = d, x[4] = WM_XO; }
+  // Keys.
+  std::vector<u64> base(R.calls.size());
+  u64 nkeys = 0;
+  for (size_t c = 0; c < R.calls.size(); c++) base[c] = nkeys, nkeys += u64(1) << R.calls[c].n;
+  static const char *SEG[WS_COUNT] = {"ROW", "N1", "N2", "N1H", "N2H", "CN1", "CN2", "QK", "QKH", "CQK", "V", "VH", "CV", "O", "D", "OH", "DH", "G", "U", "GH", "UH", "UT",
+                                      "G0", "CG", "F", "SEL", "LT", "LH", "LR", "L3", "CLR", "DD", "MR", "XR"};
+  std::vector<u64> kd(3 * WS_COUNT, 0);
+  std::vector<uint32_t> pos;
+  for (int q = 0; q < WS_COUNT; q++)
+    for (size_t c = 0; c < R.calls.size(); c++) {
+      auto it = R.place[c].find(SEG[q]);
+      if (it == R.place[c].end()) continue;
+      kd[3 * q] = base[c], kd[3 * q + 1] = R.lJ[c], kd[3 * q + 2] = pos.size();
+      for (u64 x = 0; x < it->second.n; x++) pos.push_back((uint32_t)it->second.pos(x));
+      break;
+    }
+  pos.resize(std::max<size_t>(pos.size(), 16), 0);
+  W.common.push_back(w_buffer(nkeys * 8, mx::uint64, 0));
+  W.common.push_back(w_buffer(nkeys, mx::uint8, 1));
+  W.common.push_back(mx::array(pos.data(), {(int)pos.size()}, mx::uint32));
+  W.common.push_back(w_table(kd)), W.common.push_back(w_table(md)), W.common.push_back(w_table(td));
+  auto L = [&](const char *n, int lam) { return std::string(n) + "." + std::to_string(g * Lam + lam); };
+  auto at = [&](const std::string &n) { return V.g.at(n); };
+  // The streams, one after another.
+  std::vector<mx::array> st;
+  for (int sg = 0; sg <= 2 * Lam; sg++) {
+    if (sg == 2 * Lam) st.push_back(at((g + 1) * Lam == s.L ? std::string("x_last") : "x." + std::to_string((g + 1) * Lam)));
+    else st.push_back(at(L(sg % 2 ? "x_mid" : "x", sg / 2)));
+    st.back() = mx::reshape(st.back(), {-1});
+  }
+  const mx::array S = mx::concatenate(st, 0);
+  std::vector<u64> P(std::max<int>(WP_COUNT, 8), 0);
+  P[WP_T] = T, P[WP_D] = d, P[WP_F] = s.f, P[WP_FE] = s.fe, P[WP_NE] = NE, P[WP_NQK] = s.nqk, P[WP_DQ] = s.dq, P[WP_DKV] = s.dkv, P[WP_XL] = s.XL, P[WP_NR] = s.NR;
+  P[WP_HQ] = s.hq, P[WP_HV] = s.hv, P[WP_HO] = s.ho, P[WP_HG] = s.hgD, P[WP_HU] = s.huD, P[WP_HD] = s.hdD, P[WP_HR] = s.hr, P[WP_GCL] = s.gcl, P[WP_RCL] = s.rcl, P[WP_LAM] = Lam;
+  W.launch("fp_w_stream", R"(W_CONTEXT
+    ulong j = thread_position_in_grid.x, t = thread_position_in_grid.y, T = p[WP_T], d = p[WP_D], lam2 = 2 * p[WP_LAM];
+    w_put(W, WT_XBI, 0, j, t, S[t * d + j]);
+    w_put(W, WT_XBO, 0, j, t, S[(lam2 * T + t) * d + j]);
+    for (ulong ix = 0; ix + 1 < lam2; ix++) w_put(W, WT_XS, ix, j, t, S[((ix + 1) * T + t) * d + j]);)", {{"S", S}}, w_table(P), d, T);
+  // Norm rows.
+  std::vector<u64> nrm;
+  for (int i = 0; i < 2 * Lam; i++) {
+    const LayerScales &k = m.layers[g * Lam + i / 2];
+    nrm.push_back(i % 2 ? k.M2 : k.M1), nrm.push_back((u64)(i % 2 ? m.eps2 : m.eps1));
+  }
+  W.launch("fp_w_norm", R"(W_CONTEXT
+    ulong t = thread_position_in_grid.x, i = thread_position_in_grid.y, T = p[WP_T], d = p[WP_D], NR = p[WP_NR];
+    device long *o = (device long *)out + (i * T + t) * WN_STRIDE;
+    w_norm_row(S + (i * T + t) * d, d, (long)nm[2 * i + 1], (uint)nm[2 * i], o);
+    ulong lam = i / 2, n = i % 2;
+    for (ulong j = 0; j < NR; j++) {
+      const long D = o[WN_D + j];
+      w_cell(W, WM_AR, W.td[5 * WT_ROW] + i * NR + j, t, (int)(D - 128));
+      w_key(W, WS_ROW, lam, n * NR + j, t, w_row_mul((int)j) * (ulong)D);
+    })", {{"S", S}, {"nm", w_table(nrm)}}, w_table(P), T, 2 * Lam, {(int)(2 * Lam * T * WN_STRIDE)});
+  const mx::array N = W.pending.back();
+  for (int i = 0; i < 2 * Lam; i++) {
+    const int lam = i / 2, n = i % 2;
+    P[WP_I] = i, P[WP_KN] = n ? m.layers[g * Lam + lam].K2 : m.layers[g * Lam + lam].K1, P[WP_LAMM] = lam;
+    W.launch("fp_w_normcol", R"(W_CONTEXT
+      ulong j = thread_position_in_grid.x, t = thread_position_in_grid.y, T = p[WP_T], d = p[WP_D], i = p[WP_I], lam = p[WP_LAMM], n = i % 2;
+      int K = (int)p[WP_KN];
+      long x = S[(i * T + t) * d + j], R = N[(i * T + t) * WN_STRIDE + WN_R], wv = wa[t * d + j], cv = ca[t * d + j];
+      long A = (long)((ulong)x * (ulong)R), rh = w_RH(A, wv, K, 2);
+      w_put(W, n ? WT_MW : WT_AW, lam, j, t, wv); w_put(W, n ? WT_RM : WT_RA, lam, j, t, rh); w_put(W, n ? WT_MN : WT_AN, lam, j, t, cv);
+      w_key(W, n ? WS_N2 : WS_N1, lam, j, t, w_SK(A, wv, K, 2, rh));
+      w_key(W, n ? WS_N2H : WS_N1H, lam, j, t, w_HK(rh, K, 2));
+      w_key(W, n ? WS_CN2 : WS_CN1, lam, j, t, (ulong)(wv + 32768) + ((ulong)(cv + 2048) << 28));)",
+             {{"S", S}, {"N", N}, {"wa", at(L(n ? "m_w" : "a_w", lam))}, {"ca", at(L(n ? "m" : "a", lam))}}, w_table(P), d, T);
+  }
+  for (int lam = 0; lam < Lam; lam++) {
+    const LayerScales &k = m.layers[g * Lam + lam];
+    const bool ex = NE && (lam & 1);
+    P[WP_LAMM] = lam, P[WP_EX] = ex, P[WP_KQ] = k.kq, P[WP_KK] = k.kk, P[WP_KV] = k.kv, P[WP_KO] = k.ko, P[WP_KD] = k.kd, P[WP_KG] = k.kg, P[WP_KU] = k.ku, P[WP_KGR] = k.kgR, P[WP_KUR] = k.kuR, P[WP_KR] = k.kr;
+    const mx::array Pl = w_table(P);
+    W.launch("fp_w_qk", R"(W_CONTEXT
+      ulong x = thread_position_in_grid.x, t = thread_position_in_grid.y, dq = p[WP_DQ], dkv = p[WP_DKV], lam = p[WP_LAMM]; int hq = (int)p[WP_HQ];
+      bool isq = x < dq; int kk = (int)(isq ? p[WP_KQ] : p[WP_KK]);
+      long w = isq ? qw[t * dq + x] : kw[t * dkv + x - dq], cl = isq ? qv[t * dq + x] : kv[t * dkv + x - dq], A = isq ? sq[t * dq + x] : sk[t * dkv + x - dq];
+      long rh = w_RH(A, w, kk, hq);
+      w_put(W, WT_QKW, lam, x, t, w);
+      if (hq) w_put(W, WT_RQK, lam, x, t, rh);
+      if (isq) w_put(W, WT_Q, lam, x, t, cl); else w_put(W, WT_KX, lam, x - dq, t, cl);
+      w_key(W, WS_QK, lam, x, t, w_SK(A, w, kk, hq, rh));
+      if (hq) w_key(W, WS_QKH, lam, x, t, w_HK(rh, kk, hq));
+      w_key(W, WS_CQK, lam, x, t, (ulong)(w + 32768) + ((ulong)(cl + 2048) << 28));)",
+             {{"qw", at(L("qw", lam))}, {"kw", at(L("kw", lam))}, {"qv", at(L("q", lam))}, {"kv", at(L("k", lam))}, {"sq", at(L("sum_q", lam))}, {"sk", at(L("sum_k", lam))}}, Pl, s.nqk, T);
+    W.launch("fp_w_v", R"(W_CONTEXT
+      ulong x = thread_position_in_grid.x, t = thread_position_in_grid.y, n = p[WP_DKV], lam = p[WP_LAMM]; int h = (int)p[WP_HV], kv = (int)p[WP_KV];
+      long w = vw[t * n + x], cl = vv[t * n + x], A = sv[t * n + x], rh = w_RH(A, w, kv, h);
+      w_put(W, WT_VW, lam, x, t, w);
+      if (h) w_put(W, WT_RV, lam, x, t, rh);
+      w_put(W, WT_V, lam, x, t, cl);
+      w_key(W, WS_V, lam, x, t, w_SK(A, w, kv, h, rh));
+      if (h) w_key(W, WS_VH, lam, x, t, w_HK(rh, kv, h));
+      w_key(W, WS_CV, lam, x, t, (ulong)(w + 32768) + ((ulong)(cl + 2048) << 28));)",
+             {{"vw", at(L("vw", lam))}, {"vv", at(L("v", lam))}, {"sv", at(L("sum_v", lam))}}, Pl, s.dkv, T);
+    W.launch("fp_w_o", R"(W_CONTEXT
+      ulong x = thread_position_in_grid.x, t = thread_position_in_grid.y, n = p[WP_DQ], lam = p[WP_LAMM];
+      w_put(W, WT_O, lam, x, t, ov[t * n + x]);)", {{"ov", at(L("o", lam))}}, Pl, s.dq, T);
+    W.launch("fp_w_d", R"(W_CONTEXT
+      ulong j = thread_position_in_grid.x, t = thread_position_in_grid.y, T = p[WP_T], d = p[WP_D], lam = p[WP_LAMM]; int ho = (int)p[WP_HO], hd = (int)p[WP_HD], ko = (int)p[WP_KO], kd2 = (int)p[WP_KD];
+      long s0 = S[((2 * lam) * T + t) * d + j], s1 = S[((2 * lam + 1) * T + t) * d + j], s2 = S[((2 * lam + 2) * T + t) * d + j], Q1 = s1 - s0, Q2 = s2 - s1;
+      long Ao = so[t * d + j], Ad = sd[t * d + j], r1 = w_RH(Ao, Q1, ko, ho), r2 = w_RH(Ad, Q2, kd2, hd);
+      if (ho) w_put(W, WT_RO, lam, j, t, r1);
+      if (hd) w_put(W, WT_RD, lam, j, t, r2);
+      w_key(W, WS_O, lam, j, t, w_SK(Ao, Q1, ko, ho, r1));
+      w_key(W, WS_D, lam, j, t, w_SK(Ad, Q2, kd2, hd, r2));
+      if (ho) w_key(W, WS_OH, lam, j, t, w_HK(r1, ko, ho));
+      if (hd) w_key(W, WS_DH, lam, j, t, w_HK(r2, kd2, hd));)", {{"S", S}, {"so", at(L("sum_o", lam))}, {"sd", at(L("sum_d", lam))}}, Pl, d, T);
+    W.launch("fp_w_f", R"(W_CONTEXT
+      ulong x = thread_position_in_grid.x, t = thread_position_in_grid.y, f = p[WP_F], lam = p[WP_LAMM]; int hg = (int)p[WP_HG], hu = (int)p[WP_HU];
+      bool rt = p[WP_EX] && x >= p[WP_FE]; int kg = (int)(rt ? p[WP_KGR] : p[WP_KG]), ku = (int)(rt ? p[WP_KUR] : p[WP_KU]);
+      long gv = gw[t * f + x], up = uu[t * f + x], sl = ss[t * f + x], Ag = sg[t * f + x], Au = su[t * f + x], rg = w_RH(Ag, gv, kg, hg), ru = w_RH(Au, up, ku, hu);
+      w_put(W, WT_SL, lam, x, t, sl); w_put(W, WT_UP, lam, x, t, up);
+      if (hg) w_put(W, WT_RG, lam, x, t, rg);
+      if (hu) w_put(W, WT_RU, lam, x, t, ru);
+      w_key(W, WS_G, lam, x, t, w_SK(Ag, gv, kg, hg, rg));
+      w_key(W, WS_U, lam, x, t, w_SK(Au, up, ku, hu, ru));
+      if (hg) w_key(W, WS_GH, lam, x, t, w_HK(rg, kg, hg));
+      if (hu) w_key(W, WS_UH, lam, x, t, w_HK(ru, ku, hu));
+      w_key(W, WS_UT, lam, x, t, (ulong)(up + 32768));
+      long arg = gv;
+      if (p[WP_GCL]) {
+        long g0 = ((gv + 128) & 255) - 128, gh = (gv - g0) >> 8, gc = min(max(gh, -127l), 127l);
+        arg = g0 + 256 * gc;
+        w_put(W, WT_G0, lam, x, t, g0); w_put(W, WT_GC, lam, x, t, gc); w_put(W, WT_GH, lam, x, t, gh);
+        w_key(W, WS_G0, lam, x, t, (ulong)(g0 + 128));
+        w_key(W, WS_CG, lam, x, t, (ulong)(gh + 49152) + ((ulong)(gc + 128) << 28) + (1ul << 40));
+      } else w_put(W, WT_GI, lam, x, t, gv);
+      w_key(W, WS_F, lam, x, t, (ulong)(arg + 32768) + ((ulong)(sl + 4096) << 28));)",
+             {{"gw", at(L("gw", lam))}, {"uu", at(L("u", lam))}, {"ss", at(L("s", lam))}, {"sg", at(L("sum_g", lam))}, {"su", at(L("sum_u", lam))}}, Pl, s.f, T);
+    if (ex) {
+      P[WP_LAMM] = lam, P[WP_I] = (lam - 1) / 2;
+      const mx::array Pe = w_table(P);
+      W.launch("fp_w_route", R"(W_CONTEXT
+        ulong t = thread_position_in_grid.x, NE = p[WP_NE], lam = p[WP_LAMM], lm = p[WP_I]; int hr = (int)p[WP_HR], kr = (int)p[WP_KR];
+        long chosen = es[t], sc = scv[t], mr = 0;
+        for (ulong e = 0; e < NE; e++) {
+          long lr = lrv[t * NE + e], sel = (long)e == chosen;
+          if (sel) mr = lr;
+          w_put(W, WT_LR, lm, e, t, lr); w_put(W, WT_SEL, lm, e, t, sel);
+          w_key(W, WS_SEL, lam, e, t, (ulong)(128 * sel));
+          w_key(W, WS_LT, lam, e, t, (ulong)(2 * (lr + 16384)));
+        }
+        w_put(W, WT_SC, lm, 0, t, sc);
+        for (ulong e = 0; e < NE; e++) {
+          long lr = lrv[t * NE + e], Ar = sr[t * NE + e], lw = (Ar + (1l << (kr - 1))) >> kr, rl = w_RH(Ar, lw, kr, hr);
+          if (hr) { w_put(W, WT_RL, lm, e, t, rl); w_key(W, WS_LH, lam, e, t, w_HK(rl, kr, hr)); }
+          w_key(W, WS_LR, lam, e, t, w_SK(Ar, lw, kr, hr, rl));
+          if (p[WP_RCL]) {
+            long ly = lw >> 3, l3 = lw & 7;
+            w_put(W, WT_LY, lm, e, t, ly); w_put(W, WT_L3, lm, e, t, l3);
+            w_key(W, WS_L3, lam, e, t, (ulong)(32 * l3));
+            w_key(W, WS_CLR, lam, e, t, (ulong)(ly + 32768) + ((ulong)(lr - l3) << 25) + (1ul << 39));
+          }
+          long after = 0;
+          for (ulong e2 = e + 1; e2 < NE; e2++) after += (long)e2 == chosen;
+          w_key(W, WS_DD, lam, e, t, (ulong)(mr - lr - after));
+        }
+        w_key(W, WS_MR, lam, 0, t, p[WP_GCL] ? (ulong)(mr + 16384) + ((ulong)sc << 17) : (ulong)(mr + 32768) + ((ulong)sc << 17));)",
+               {{"es", at(L("e_star", lam))}, {"scv", at(L("sc", lam))}, {"lrv", at(L("lr", lam))}, {"sr", at(L("sum_r", lam))}}, Pe, T, 1);
+      W.launch("fp_w_xr", R"(W_CONTEXT
+        ulong j = thread_position_in_grid.x, t = thread_position_in_grid.y, d = p[WP_D], lam = p[WP_LAMM], lm = p[WP_I];
+        long mn = mv[t * d + j], xv = xr[t * d + j], sc = scv[t];
+        w_put(W, WT_XR, lm, j, t, xv);
+        w_key(W, WS_XR, lam, j, t, (ulong)(sc * mn + 32768 - 65536 * xv));)",
+               {{"mv", at(L("m", lam))}, {"xr", at(L("xr", lam))}, {"scv", at(L("sc", lam))}}, Pe, d, T);
+    }
+  }
+  mx::eval(W.pending);
+  // Back into the group's host structures, which the proof reads.
+  for (int q = 0; q < WM_COUNT; q++) {
+    const int32_t *c = W.common[q].data<int32_t>();
+    for (CellMatrix2 &part : mats[q]->part) { memcpy(part.cell.data(), c, part.cell.size() * 4); c += part.cell.size(); }
+  }
+  const uint64_t *keys = W.common[WM_COUNT].data<uint64_t>();
+  const uint8_t *pad = W.common[WM_COUNT + 1].data<uint8_t>();
+  for (size_t c = 0; c < R.calls.size(); c++) {
+    memcpy(R.calls[c].keys.data(), keys + base[c], R.calls[c].keys.size() * 8);
+    memcpy(R.calls[c].padding.data(), pad + base[c], R.calls[c].padding.size());
+    // A padding position holds the value of row t0 only in lookup_leaves(), not here: as ff_build().
+  }
+  R.rows.assign(2 * Lam, std::vector<NormRow>(T));
+  const int64_t *n = N.data<int64_t>();
+  for (int i = 0; i < 2 * Lam; i++)
+    for (int t = 0; t < T; t++) {
+      const int64_t *o = n + ((size_t)i * T + t) * WN_STRIDE;
+      NormRow &r = R.rows[i][t];
+      r.a = o[WN_A], r.b = o[WN_B], r.sig = o[WN_SIG], r.Rlo = o[WN_RLO], r.Rhi = o[WN_RHI], r.R = o[WN_R];
+      r.D.assign(o + WN_D, o + WN_D + 99);
+      r.W.assign(o + WN_W, o + WN_W + 9);
+    }
 }
 }

@@ -36,6 +36,9 @@ private:
   const blk::u64 *p_ = nullptr;
   size_t n_ = 0;
 };
+// A kernel by name, compiled once, with the headers of mlx/kernels. A grid of threads x rows, 64-bit output.
+std::vector<mx::array> run_kernel(const std::string &name, const std::string &body, const std::vector<mx::array> &in, const std::vector<std::string> &names,
+                                  const std::vector<mx::Shape> &shapes, size_t threads, size_t rows = 1);
 Buf e_upload(const std::vector<blk::E> &v);
 std::vector<blk::E> e_download(const Buf &a);
 // rows x 2^log_dim coefficients to rows x 2^log_n symbols: Encoder::encode() on every row.

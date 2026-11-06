@@ -41,6 +41,7 @@ using I64 = long long;
 struct Values {
   std::map<std::string, std::vector<I64>> v;
   std::map<std::string, int> cols;
+  std::map<std::string, mx::array> g; // the same values on the GPU, int64
   const std::vector<I64> &at(const std::string &n) const { auto it = v.find(n); if (it == v.end()) throw std::runtime_error("no value " + n); return it->second; }
   I64 get(const std::string &n, int t, int x) const { return at(n)[(size_t)t * cols.at(n) + x]; }
 };
@@ -51,6 +52,7 @@ inline Values capture_forward(const ModelShape &p, const Tensors &w, const mx::a
     mx::eval(c);
     out.v[name].assign(c.data<int64_t>(), c.data<int64_t>() + c.size());
     out.cols[name] = c.ndim() == 2 ? c.shape(1) : 1;
+    out.g.insert_or_assign(name, c);
   };
   mx::array lam = forward(p, w, tokens, note);
   mx::eval(lam);
