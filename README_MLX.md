@@ -7,7 +7,7 @@ mlx/demo.sh ~/fpwork/demo
 ```
 
 It needs `.venv` with `mlx`, Homebrew's `gcc`, `llvm` and GNU tools. See `MLX_PORT_STATUS.md` for what
-was measured and for the limits: most of a proof's time is still on CPU threads.
+was measured and for the limits: the work that grows with the model runs on Metal, and witness assembly is still host code.
 
 # FlashProve on MLX: reproducing the results
 
@@ -41,6 +41,7 @@ mlx/build.sh engine_test && mlx/build/engine_test
 for t in toy_cpu toy_mlx segments_cpu segments_mlx; do mlx/build.sh $t && mlx/build/$t 8 42; done
 .venv/bin/python mlx/tests/make_reference.py prover/examples/target_small_f2_roomy /tmp/ref
 mlx/build.sh forward_test && mlx/build/forward_test /tmp/ref
+for t in psc_gpu_test form_gpu_test coins_gpu_test kernels_gpu_test; do mlx/build.sh $t && mlx/build/$t; done
 mlx/run_library_tests.sh
 ```
 

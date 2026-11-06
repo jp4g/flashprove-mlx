@@ -163,6 +163,7 @@ public:
     mine();
     const Table &t = table(id);
     BLK_REQUIRE((u64(1) << v.vars()) == t.entries(), "evaluate: the vector and the table differ in length");
+    if (!v.is_held() && v.vars() >= 12 && !fpmlx::in_forked_child()) return dot_with_table(fpmlx::tensors_written({v}, v.vars()), t);
     std::vector<E> w(t.entries(), E::zero());
     (v.is_held() ? readable(v) : v).add_to(w.data());
     return dot_with_table(w, t);

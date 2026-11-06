@@ -1,41 +1,68 @@
 # MLX port: status
 
 Branch `mlx-port`. **Milestone 1's chain works: a request on the bundled synthetic model is proved by
-the native prover and the unmodified `bin/cp_verify` answers `YES`.** It is not a GPU-only prover yet:
-the sumchecks and lookups still run on CPU threads (below). SmolLM2 is no longer the end goal, by the
-owner's decision of 2026-11-05, and nothing of it is built. Everything below is measured on an Apple M5
-Pro (64 GB, macOS 27), MLX 0.32.4.
+the native prover and the unmodified `bin/cp_verify` answers `YES`. The work that grows with the model
+now runs on Metal; a proof takes 21 s, of which about 11 s is CPU time.** What is still host code is
+listed under the limits. SmolLM2 is no longer the end goal, by the owner's decision of 2026-11-05, and
+nothing of it is built. Everything below is measured on an Apple M5 Pro (64 GB, macOS 27), MLX 0.32.4.
 
 ## The result
 
 `mlx/demo.sh` runs it all from synthetic weights: reference, placing, commitment, proof, the stock
-`cp_verify` in a separate process, four rejected changes. Last run, commitment ID
-`240e59038f03ecbde1af337de677312ccdad2e97f126a66858ae291c7daf6705`:
+`cp_verify` in a separate process, four rejected changes. Last run, from an empty directory, commitment
+ID `4c317f4c8a3a9da11e9ceb0e288aab5cd435f0f3e43582d1c025a3dff9efee1e`:
 
-| Step | Measured |
-|---|---|
-| Commitment (`fp_commit`) | about 4 min; the key step runs on the CPU (`WfCpu`) |
-| Proof (`fp_prove`, leaf table rebuilt, equation test on) | 49.3 s; 46.4 s with `FP_NO_EQUATION_TEST=1` |
-| Segments | G0 9.2 s, A0 4.8 s, G1 10.3 s, A1 5.6 s, H 6.6 s |
-| Proof size | 4,158,700 bytes |
-| `cp_verify` | 0.71 s, exit 0, last line `YES` |
-| Memory | maximum resident 23.9 GB; `peak memory footprint` 62.5 GB, not yet explained |
-| CPU time of a proof | 122.7 s user in 47.1 s real: most of the proof is on CPU threads |
+| Step | Before the move to Metal | Now |
+|---|---|---|
+| Commitment (`fp_commit`) | about 4 min | 87 s and 118 s in two runs: the key file took 54 s and 91 s, with different seeds; much of the key file is the nonce search |
+| Proof (`fp_prove`, leaf table rebuilt, equation test on) | 51.0 s | 21.3 s |
+| CPU time of a proof | 124.2 s user, 10.6 s system | 10.8 s user, 6.1 s system |
+| Segments | G0 9.2 s, A0 4.8 s, G1 10.3 s, A1 5.6 s, H 6.6 s | G0 3.7 s, A0 1.6 s, G1 3.8 s, A1 1.5 s, H 1.9 s |
+| Proof size | 4,158,700 bytes | 4,153,500 bytes (it differs from proof to proof) |
+| `cp_verify` | 0.71 s, exit 0, `YES` | 0.69 s, exit 0, `YES` |
+| Memory | peak footprint 63.4 GB | peak footprint 37.6 GB; MLX's peak in use 29.2 GB |
 
-`cp_verify`'s lines on a run of this prover: `covered: r=15 e=64 T=64`, `proof of work: up to 32 bits
-counted in 38 rounds; with it the least round has 128.00 bits, without it 96.23 bits`, these bits being
-no security level (`guide/known-limits.md`). This `YES` is `cp_verify`'s, on a small model with synthetic
-weights. It says nothing of a provider's model, and it does not show that the weights are hidden
-(`guide/weight-hiding.md`).
+These are single runs, not averages. The old footprint was mostly MLX's cache of freed buffers (34 GB at
+the end of a proof); `fp_prove` and `fp_commit` now limit that cache to 4 GB (`FP_MLX_CACHE_GB` for
+`fp_prove`). `fp_commit` still peaked at 61 GB in the one run measured.
 
-Refused, each exit 1: a changed token (`NO: reply-differs`), a changed request, flipped bytes early, in
-the middle and late, a cut proof (all `NO: proof-refused`), another commitment ID (`NO: model-statement`).
-Two proofs of one request are both accepted and differ from byte 13 on.
+`cp_verify`'s lines on the last run: `covered: r=15 e=64 T=64`, `commitment: 49 closeness rounds of the
+one-time files rest on another source than the bound within a third of the distance; the table has a
+record: the binding of the weights rests on the theorem on codes (ePrint 2025/2055, Theorem 4.6), taken
+as given`, `proof of work: up to 32 bits counted in 38 rounds; with it the least round has 128.00 bits,
+without it 96.23 bits`, these bits being no security level (`guide/known-limits.md`). This `YES` is
+`cp_verify`'s, on a small model with synthetic weights. It says nothing of a provider's model, and it
+does not show that the weights are hidden (`guide/weight-hiding.md`).
+
+Refused in the demo, each exit 1: a changed token (`NO: reply-differs`), a changed request and a changed
+proof byte (`NO: proof-refused`), another commitment ID (`NO: model-statement`). By hand on the same
+proof, also exit 1 and `NO: proof-refused`: one bit flipped early, in the middle and late, and a cut
+proof. A second proof of the same request is accepted too and differs from byte 13 on.
+
+## GPU and CPU agreement
+
+With one seed, the moved `fp_commit` wrote every file of the commitment byte for byte as the CPU path had
+(`diff -r` of `ivk`, same commitment ID). A proof has fresh masks, so proofs are compared through
+`cp_verify` and through these tests, each against plain host code:
+
+| Test | Compares | Result |
+|---|---|---|
+| `psc_gpu_test` | every sent word, challenge and end value of a sumcheck, on 288 configurations; a deliberately wrong bind kernel made 234 of 252 differ | 288 of 288 equal |
+| `form_gpu_test` | `tensors_written` against `Tensor::add_to` | 36 of 36 equal |
+| `coins_gpu_test` | `MetalCoins` against `StreamCoins`, short and long draws | 9 of 9 equal |
+| `kernels_gpu_test` | combinations, column sums, `g^T M`, product levels, lookup leaves, transpose | 6 of 6 equal |
 
 ## Limits of this result
 
-- **CPU, not GPU:** on the GPU are the integer forward products, the encoding, the Merkle trees, the
-  nonce search and the folds. The lookups, sumchecks, witnesses and the key step are host code.
+- **On the GPU:** the integer forward products, the encoding, the Merkle trees, the nonce search, the
+  folds, the fold's coefficient vectors, sumcheck rounds from 2^13 values up, product trees, the smallness
+  test's combinations and U3, `g^T M`, long coin draws, and the key step's lookups.
+- **Still host code:** assembling the witnesses and their tables (`ff_build`, `attn_build`, `head_build`,
+  `Values`, `lay_block`) and uploading them; sumcheck rounds below 2^13 values; the transcript and all
+  arithmetic on a few scalars; the prover's own sum checks (`attn_sum3`); reading tables for
+  `dot_with_table`; laying out a fold's rows; `IndexMlx::fold`; the member's sumcheck (`SumcheckCpu` over
+  2^11 columns); and in the commitment `WfCpu::keys` and the lookup's leaves. The CPU path of `psc_run`
+  stays for the short rounds, and for runs with `FP_PSC_GPU_MIN=0`.
 - **The companion:** `fp_prove` needs a patched build of the verifier running beside it, for each
   segment's equation and public parts. It is a helper of the prover. It decides nothing: the judge is
   the stock `cp_verify`, built without those patches.
@@ -70,14 +97,15 @@ port and nothing here depends on it.
 
 ## Library tests with EngineMlx in place of EngineCpu (`mlx/run_library_tests.sh`)
 
-37 test programs, all pass. `EngineMlx` runs on the GPU in the parent process. Tests that `fork()`
+37 test programs, all pass, rerun after the move to Metal. `EngineMlx` runs on the GPU in the parent process. Tests that `fork()`
 to check that a misuse ends the process run the engine's host path in the child (Metal does not
 survive a fork), so those children exercise the engine's guards, not its kernels.
 
 ## Not done
 
-- Moving the lookups and sumchecks to Metal, then `WfCpu` and the witnesses, by profile.
+- Moving the witness assembly to Metal. By profile the wall time is now mostly GPU work: the coefficient
+  vectors, encoding (each layer is a pass over memory), the nonce search.
 - Keeping a table's batch count between runs.
-- Explaining the 62.5 GB footprint.
+- Why `fp_commit` still peaks at 61 GB.
 - A CLI beyond `fp_commit`, `fp_prove` and `mlx/demo.sh`; benchmarks over repeated runs.
 - SmolLM2: dropped as the end goal. A separate verifier variant would be needed for it.
