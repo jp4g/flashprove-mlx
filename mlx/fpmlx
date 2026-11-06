@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+# Copyright 2026 Anthropic PBC
+# SPDX-License-Identifier: Apache-2.0
+"""FlashProve on this Mac, for synthetic or public weights only.
+
+  fpmlx prepare CONFIG DIR                 reference values, the matrix of cells and a request, into DIR
+  fpmlx commit  CONFIG DIR                 the commitment: DIR/isk (secret) and DIR/ivk (public); prints the ID
+  fpmlx prove   CONFIG DIR -id ID -out P   a proof of DIR/request.req: P, and the next token in P.y
+  fpmlx verify  CONFIG IVK REQUEST Y PROOF -id ID
+                                           the stock bin/cp_verify, with files and an ID that you trust
+
+verify takes nothing from the prover's directory by itself. Give it the ID that the commitment printed, or
+one from a party you trust, never one taken from files that came with a proof. Its exit code is cp_verify's.
+"""
+import argparse, os, shutil, subprocess, sys
+
+TOP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+B = os.path.join(TOP, "mlx", "build")
+PY = os.path.join(TOP, ".venv", "bin", "python")
+
+
+def need(binary, script, *args):
+    if not os.access(os.path.join(TOP, binary), os.X_OK):
+        run([os.path.join(TOP, script), *args])
+
+
+def run(cmd, **kw):
+    r = subprocess.run(cmd, cwd=TOP, **kw)
+    if r.returncode:
+        sys.exit(r.returncode)
+    return r
+
+
+def prepare(a):
+    d = os.path.abspath(a.dir)
+    ref = os.path.join(d, "ref")
+    os.makedirs(d, exist_ok=True)
+    need("mlx/build/head_keys_test", "mlx/build.sh", "head_keys_test")
+    if not os.path.isfile(os.path.join(ref, "matrix.i8")):
+        run([PY, "mlx/tests/make_reference.py", a.config, ref] + ([os.path.abspath(a.tokens)] if a.tokens else []))
+        run([PY, "mlx/tools/place_weights.py", ref, "11", "2048"])
+    req = os.path.join(d, "request.req")
+    if not os.path.isfile(req):
+        with open(os.path.join(d, "request.log"), "wb") as log:
+            start = os.path.abspath(a.tokens) if a.tokens else os.path.join(a.config, "own_choices.req")
+            run([os.path.join(B, "head_keys_test"), ref, os.path.join(a.config, "policy.txt"), start, req], stdout=log)
+    print("prepared:", d)
+
+
+def commit(a):
+    d = os.path.abspath(a.dir)
+    need("mlx/build/fp_commit", "mlx/build_commit.sh")
+    isk = os.path.join(d, "isk")
+    os.makedirs(isk, mode=0o700, exist_ok=True)
+    log = os.path.join(d, "commit.log")
+    with open(log, "wb") as f:
+        run([os.path.join(B, "fp_commit"), a.config, os.path.join(d, "ref", "matrix.i8"), os.path.join(d, "ivk"), os.path.join(isk, "seed")], stdout=f)
+    print(open(log).read().strip().splitlines()[-1])
+
+
+def prove(a):
+    d = os.path.abspath(a.dir)
+    need("mlx/build/fp_prove", "mlx/build_prove.sh")
+    need("mlx/build/fp_companion", "mlx/build_companion.sh")
+    out = os.path.abspath(a.out)
+    request = os.path.abspath(a.request) if a.request else os.path.join(d, "request.req")
+    with open(out + ".log", "wb") as f:
+        timing = ["/usr/bin/time", "-l", "-o", os.path.abspath(a.time)] if a.time else []
+        r = subprocess.run(timing + [os.path.join(B, "fp_prove"), a.config, os.path.join(d, "ivk"), os.path.join(d, "ref"), os.path.join(d, "isk", "seed"), request, "auto", a.id, out, os.path.join(B, "fp_companion")], cwd=TOP, stdout=f)
+    if r.returncode:
+        print(open(out + ".log").read()[-400:], file=sys.stderr)
+        sys.exit(r.returncode)
+    shutil.copyfile(out + ".work/y", out + ".y")
+    for line in open(out + ".log"):
+        if line.startswith(("proof:", "table:")) and ("spent" in line or line.startswith("proof:")):
+            print(line.strip())
+
+
+def verify(a):
+    need("bin/cp_verify", "verifier/build.sh")
+    policy = ["-policy", a.policy] if a.policy else []
+    sys.exit(subprocess.run([os.path.join(TOP, "bin", "cp_verify"), a.config, a.ivk, a.request, a.y, a.proof, "-id", a.id] + policy).returncode)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    s = p.add_subparsers(dest="command", required=True)
+    c = s.add_parser("prepare"); c.add_argument("config"); c.add_argument("dir"); c.add_argument("-tokens", help="a request to start from, if the kit has no own_choices.req"); c.set_defaults(go=prepare)
+    c = s.add_parser("commit"); c.add_argument("config"); c.add_argument("dir"); c.set_defaults(go=commit)
+    c = s.add_parser("prove"); c.add_argument("config"); c.add_argument("dir"); c.add_argument("-id", required=True); c.add_argument("-out", required=True); c.add_argument("-request"); c.add_argument("-time", help="write /usr/bin/time -l of the prover to this file"); c.set_defaults(go=prove)
+    c = s.add_parser("verify")
+    for x in ("config", "ivk", "request", "y", "proof"):
+        c.add_argument(x)
+    c.add_argument("-id", required=True); c.add_argument("-policy", help="clipped-gap,C,THETA,CAP,S,SH, the policy that you expect"); c.set_defaults(go=verify)
+    a = p.parse_args()
+    if hasattr(a, "config") and a.command != "verify":
+        a.config = os.path.abspath(a.config)
+    a.go(a)
+
+
+main()

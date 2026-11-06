@@ -18,3 +18,4 @@
 # What Python and pytest leave behind.
 __pycache__/
 .pytest_cache/
+/mlx/build/

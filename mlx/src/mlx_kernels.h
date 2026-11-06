@@ -1,0 +1,206 @@
+// Copyright 2026 Anthropic PBC
+// SPDX-License-Identifier: Apache-2.0
+// Field arithmetic on MLX arrays of uint64. Elements of F are canonical words; an array of E has a
+// last axis of 3 coordinates.
+#pragma once
+#include <mlx/mlx.h>
+#include <memory>
+#include <string>
+#include <vector>
+#include "field/field.h"
+#include "hash/hash.h"
+#include "iop/tensor.h"
+#include "tree/opening.h"
+namespace fpmlx {
+namespace mx = mlx::core;
+std::string read_kernel_header(const char *name);
+mx::array f_binary(const char *op, const mx::array &a, const mx::array &b); // "add" "sub" "mul"
+mx::array e_mul(const mx::array &a, const mx::array &b);
+// Words that an engine keeps: an evaluated MLX array, whose memory the CPU reads too. Metal does not
+// survive fork(): in a forked child (the library's tests that check that a misuse ends the process)
+// a Buf holds host words and each operation below takes a plain host path. An array that a child
+// inherits is read, not released.
+bool in_forked_child();
+// A test's switch: the witness, lookup and form kernels take their plain host paths, so that a whole proof
+// can be compared with the kernels' (mlx/tests/whole_proof_test.sh). Encoding, the trees and the nonce search
+// stay on the GPU: engine_test compares those.
+bool &reference_paths();
+// In the test of that comparison: n > 0 corrupts the n-th product level of a lookup, so that the test can show
+// that it would see a wrong kernel.
+int &test_fault();
+class Buf {
+public:
+  Buf() = default;
+  explicit Buf(const mx::array &a);
+  explicit Buf(std::vector<blk::u64> host);
+  const blk::u64 *data() const { return p_; }
+  size_t size() const { return n_; }
+  bool on_gpu() const { return (bool)a_; }
+  const mx::array &array() const { return *a_; }
+private:
+  std::shared_ptr<mx::array> a_;
+  std::shared_ptr<std::vector<blk::u64>> h_;
+  const blk::u64 *p_ = nullptr;
+  size_t n_ = 0;
+};
+// A kernel by name, compiled once, with the headers of mlx/kernels. A grid of threads x rows, 64-bit output.
+std::vector<mx::array> run_kernel(const std::string &name, const std::string &body, const std::vector<mx::array> &in, const std::vector<std::string> &names,
+                                  const std::vector<mx::Shape> &shapes, size_t threads, size_t rows = 1);
+Buf e_upload(const std::vector<blk::E> &v);
+std::vector<blk::E> e_download(const Buf &a);
+// rows x 2^log_dim coefficients to rows x 2^log_n symbols: Encoder::encode() on every row.
+Buf encode_rows(const blk::u64 *coefficients, size_t rows, unsigned log_dim, unsigned log_n, const blk::F *tw);
+blk::E dot(const Buf &a, const Buf &b);
+void fold_round(const Buf &c, const Buf &m, size_t rows, size_t len, blk::E q[3]);
+Buf halve(const Buf &t, size_t rows, size_t len, const blk::E &g);
+blk::u64 search_nonce(const blk::ChainPrefix &prefix, unsigned bits);
+// Words 0 .. n - 1 of a coin stream (blocks/coins/coins.h).
+Buf chacha_words(const blk::u32 key[8], blk::u32 stream, size_t n);
+// The smallness test's combinations: entry u m + i is the sum over c of theta[c tau + u] cells[i k + c],
+// plus 2^17; ~0 if it leaves the window [-2^17, 2^17).
+Buf combinations(const int32_t *cells, size_t m, size_t k, const signed char *theta, size_t tau);
+// The sum of Tensors written out, 2^vars entries of E, each thread summing one entry. The words may be
+// changed by the caller until the Buf is given to a kernel.
+Buf tensors_written(const std::vector<blk::Tensor> &tensors, unsigned vars);
+struct TableSide { mx::array bits_rows, leaves; };
+// Tables on the GPU: the words of a blk::Table, a[(row * len + place) * deg + coordinate].
+struct TableWords { Buf a; unsigned deg = 1, log_rows = 0; size_t rows = 0, len = 0; };
+TableWords table_words(const blk::Table &t);
+// sum_j w[j] entry(j), entry() as blk::Table's.
+blk::E dot_table(const Buf &w, const TableWords &t);
+// A block of table rows into a fold's rows of E: out[(first + b) len + i], in place; out stays a Buf whose
+// array is given to the next kernel. Returns a token for the order of the kernels.
+mx::array e_rows_buffer(size_t entries);
+mx::array put_rows(const mx::array &out, const TableWords &t, size_t first_row);
+// The coefficients of rows from a message and a tail, then the encoding: EngineCpu's encode on every row.
+// first, count: the table rows to encode; count 0: all.
+Buf encode_table(const TableWords &msg, const TableWords &tail, size_t message_at, size_t tail_at, size_t ell, size_t r, unsigned log_dim, unsigned log_n, const blk::F *tw, size_t first = 0, size_t count = 0);
+// out[j] += scale entry(i), j being i with its bits spread over the bits outside mask, and value at mask: an
+// engine's term of a Form. In place.
+void add_term(const Buf &out, const TableWords &t, const blk::E &scale, blk::u64 mask, blk::u64 value);
+// A committed table's message: entry j + per y of row r is cell (y, j + per r); then pads; 0 elsewhere.
+mx::array index_message(const int8_t *cells, size_t rows, size_t columns, size_t table_rows, size_t ell, size_t per, size_t plain, const std::vector<blk::u64> &pads, size_t pads_each);
+// out[j] = sum_x w[x] m[x len + j], m in F.
+std::vector<blk::E> rows_left(const mx::array &m, size_t rows, size_t len, const std::vector<blk::E> &w);
+// The commitment's lookups (blocks/iop/wf.h, lkp.h). wf_run: keys of a run, in place in `keys`, a word of F each:
+// offset + sum_q weight[q] cell(first_row + i + q stride, c) at place first + c + i columns; padding flag cleared.
+mx::array wf_run(const mx::array &keys, const mx::array &pad, const int8_t *matrix, size_t matrix_cells, size_t columns, size_t first, size_t first_row, size_t places, size_t stride, blk::F offset, const std::vector<blk::F> &weights);
+// A part's leaves: blocks is by (first, log_trees, function + 1), with `rows` the padding row of each.
+mx::array lkp_leaves(const mx::array &keys, size_t first, unsigned v, unsigned g, const std::vector<blk::u64> &blocks, const std::vector<blk::E> &rows, const blk::E &alpha, const blk::E &theta);
+// leaves[p + (i << step)] = value, for i < length; in place.
+mx::array lkp_pad(const mx::array &leaves, size_t p, unsigned step, size_t length, const blk::E &value);
+// R[i] = alpha - 1 - table[i / w], and 1 + bits[i] R[i].
+TableSide lkp_table_side(const mx::array &bits, const mx::array &table, size_t w, const blk::E &alpha);
+// count[row] += 1 for each key that is not padding, row being the key (no table) or its place in the table:
+// `values` ascending, `rows` beside them, the lowest row first among equals. False: a key is in no row.
+bool lookup_counts(const std::vector<blk::u64> &keys, const std::vector<char> &padding, unsigned k, const std::vector<blk::u64> &values, const std::vector<blk::u32> &rows, blk::u32 *count);
+// entry b + rows i of `dense` to place b ell + i, for b < rows, i < ell.
+Buf rows_first(const Buf &dense, size_t rows, size_t ell);
+// A lookup's product trees. Level m has 2^m vertices; a vertex is the product of two of the level below,
+// i and i + 2^m, so the level below is two maps of the level's length, one after the other.
+mx::array product_level(const mx::array &below);
+std::vector<blk::E> e_fetch(const mx::array &a);
+mx::array e_on_gpu(const std::vector<blk::E> &v);
+// The key side's leaves, alpha - (value + call theta): position i = y + 2^rK x; see lookup_run().
+struct LeafPlan {
+  unsigned rK = 0, dT = 0, v = 0;
+  blk::u64 NT = 0;
+  blk::E alpha, theta, pad0;
+  std::vector<blk::u64> tree_call, tree_first; // by tree y: its call, and the place of its first key in `keys`
+  std::vector<blk::u64> pad_value;             // by call: the value of the padding row
+};
+mx::array lookup_leaves(const LeafPlan &p, const std::vector<blk::u64> &keys, const std::vector<char> &padding);
+// A lookup's table side. Leaf i = (t | c | j). rows: by call, 2^kT row values each (the call's table
+// repeated); mult: by call, 2^kT counts. bits_rows: the two maps b and alpha - 1 - row, one after the other.
+TableSide lookup_table_side(unsigned kT, unsigned cK, unsigned NC, const std::vector<blk::u64> &rows, const std::vector<blk::u32> &mult, const blk::E &alpha, const blk::E &theta);
+// A matrix's cells packed three rows to a word: CellMatrix2::packed(), written out; out[i k + c], in F.
+Buf pack_cells(const int32_t *cells, size_t m, size_t k);
+// One LaidBlock of an array into a table's words, in place. src: words of F (deg 1) or E (deg 3).
+mx::array lay_block(const mx::array &table, unsigned table_deg, size_t len, const mx::array &src, unsigned src_deg, size_t columns, const blk::u64 *block /* first_i, first_c, first_row, first_place, bits_i, bits_c, place_bits, i_is_low */);
+// A matrix's combinations into the smallness test's digits: low and high keys at (u << lc) + off + i, ZZ
+// at u 2 mz + off + i and u 2 mz + mz + off + i. flag[0] is set if one has left its window. In place.
+mx::array digit_split(const mx::array &v, size_t m, size_t tau, size_t off, size_t mz, unsigned lc, const mx::array &low, const mx::array &high, const mx::array &pad, const mx::array &zz, const mx::array &flag);
+// Sums with weights over a forward pass's int64 values, T rows of n: by column, sum_t w[t] v[t n + x]; by
+// row, sum_x w[x] v[t n + x].
+std::vector<blk::E> token_dots(const mx::array &v, size_t T, size_t n, const std::vector<blk::E> &w);
+std::vector<blk::E> row_dots(const mx::array &v, size_t T, size_t n, const std::vector<blk::E> &w);
+// The rope's pairs of step 8: at (pa, t), out[2 (pa T + t)] and + 1: sum over the heads of co (w0 p0 + w1 p1) and
+// co (w1 p0 - w0 p1), p from the sums before the rope, w0 = ew[hd dh + 2 pa], w1 the next.
+std::vector<blk::E> rope_pairs(const mx::array &preq, const mx::array &prek, size_t H, size_t G, size_t dh, size_t T, const std::vector<blk::E> &ew, const blk::E &co);
+// Step 6's table: entry (i P + j) T + t is sum_l gp[l] limb_l(stream i, t, j); 0 at j >= d. n entries.
+mx::array stream_table(const mx::array &streams, size_t NI, size_t T, size_t d, size_t P, unsigned limbs, const std::vector<blk::E> &gp, size_t n);
+// Into a table of E, in place: entry (index P + x) T + t = -v[t cols + first + x], for x < count.
+mx::array minus_rows(const mx::array &table, const mx::array &v, size_t cols, size_t first, size_t count, size_t index, size_t P, size_t T);
+// sum_i w[i] a[i] b[i].
+blk::E dot3(const std::vector<blk::E> &w, const mx::array &a, const mx::array &b);
+// Smallness::u3(): entry c nb + b is the sum over r < len of phi[r] cells[(b len + r) k + c].
+Buf column_sums(const int32_t *cells, size_t k, size_t nb, const std::vector<blk::E> &phi);
+// g^T M on a matrix of signed bytes, rows x columns.
+Buf bytes_left(const int8_t *cells, size_t rows, size_t columns, const std::vector<blk::E> &g);
+// The same on rows first .. of a matrix that stays on the GPU between calls, matrix_cells being its size.
+Buf matrix_left(const int8_t *matrix, size_t matrix_cells, size_t first, size_t rows, size_t columns, const std::vector<blk::E> &g);
+// The rounds of a sumcheck, its maps on the GPU. The summand is compiled into a kernel by its shape.
+struct SumShape {
+  std::vector<blk::E> coeff;              // by monomial
+  std::vector<std::vector<unsigned>> maps; // by monomial: indices of the maps multiplied
+};
+// The weight of a later round: (lo, hi) at the place `at` of the index that the round before it sees.
+struct SumWeight { blk::E lo, hi; unsigned at = 0; };
+class SumRounds {
+public:
+  // Takes the maps' values: `maps` are empty afterwards, until fetch(). later[l]: the weight that round
+  // l + 1 adds to round l's table; rounds = later.size() + 1.
+  SumRounds(std::vector<std::vector<blk::E>> &maps, SumShape shape, const std::vector<SumWeight> &later);
+  // Maps already on the GPU: `count` maps of equal length, one after another.
+  SumRounds(const mx::array &maps, unsigned count, SumShape shape, const std::vector<SumWeight> &later);
+  // g at the nodes 0 .. d - 1 of round l: the sum over the pairs along `step`, with the round's weights.
+  std::vector<blk::E> nodes(size_t l, unsigned d, size_t step);
+  void bind(const blk::E &r, size_t step);
+  void fetch(std::vector<std::vector<blk::E>> &maps) const;
+private:
+  void prepare(const std::vector<SumWeight> &later);
+  SumShape shape_;
+  std::vector<unsigned> used_;   // the maps that the summand reads
+  mx::array m_;                  // map k's values at k * size_
+  std::vector<mx::array> w_;     // w_[l]: round l's table of weights
+  mx::array coeff_, program_;    // program_: for a summand too long to compile, its monomials as data
+  size_t count_, size_;
+};
+// blk::OracleTree with its leaves and vertices hashed on the GPU. The same draws from `coins`.
+class OracleTreeMlx {
+public:
+  OracleTreeMlx(const blk::OracleTreeShape &s, blk::Coins &coins);
+  blk::Digest build(const std::vector<Buf> &main, const std::vector<Buf> &mask);
+  // A table of main rows only, in chunks of equal numbers of rows: no copy joins them.
+  blk::Digest build_chunks(const std::vector<Buf> &chunks, size_t rows_each);
+  template <class Fetch> void open(const blk::PositionList &list, blk::Opening &o, Fetch fetch) const {
+    (void)blk::opening_given(s_, list);
+    o = blk::Opening();
+    o.main_width = s_.main_width(), o.mask_width = s_.mask_width();
+    std::vector<blk::F> column;
+    for (size_t i = 0; i < list.size(); i++) {
+      fetch(list[i], column);
+      BLK_REQUIRE(column.size() == s_.width(), "oracle tree: a fetched column has not the leaf's size");
+      o.columns.insert(o.columns.end(), column.begin(), column.end());
+      o.salts.insert(o.salts.end(), salt_.begin() + list[i] * s_.salt_bytes, salt_.begin() + (list[i] + 1) * s_.salt_bytes);
+    }
+    struct Side {
+      struct Value {};
+      const OracleTreeMlx &t;
+      std::vector<blk::Digest> out;
+      Value leaf(size_t) { return {}; }
+      bool given(unsigned d, blk::u64 place, Value &) { out.push_back(t.digest(d, place)); return true; }
+      Value node(unsigned, blk::u64, const Value &, const Value &) { return {}; }
+    } side{*this, {}};
+    typename Side::Value root;
+    blk::tree_walk(s_.tree(), list, side, root);
+    o.given = std::move(side.out);
+  }
+private:
+  blk::Digest levels(const mx::array &leaves);
+  blk::Digest digest(unsigned depth, blk::u64 place) const;
+  blk::OracleTreeShape s_;
+  std::vector<blk::u8> salt_;
+  std::vector<Buf> level_; // level_[d]: 2^d digests of 4 words
+};
+}
