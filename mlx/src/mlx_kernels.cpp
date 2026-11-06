@@ -110,7 +110,9 @@ static Buf encode_array(const mx::array &coefficients, size_t rows, unsigned ld,
   const mx::array table = words(reinterpret_cast<const blk::u64 *>(tw), n);
   mx::array a = run("fp_spread", "uint x = thread_position_in_grid.x, row = thread_position_in_grid.y; ulong n = p[0], block = p[1]; out[row * n + x] = c[row * block + (x & (block - 1))];",
                     {coefficients, words(std::vector<blk::u64>{n, block})}, {"c", "p"}, {{(int)rows, (int)n}}, n, rows)[0];
-  for (unsigned L = ld; L-- > 0;) {
+  // The eleven lowest layers work within blocks of 2^11 words, which fit a threadgroup: one pass over memory.
+  const unsigned fused = ld >= 11 ? 11 : 0;
+  for (unsigned L = ld; L-- > fused;) {
     const mx::array p = words(std::vector<blk::u64>{n, L});
     a = run("fp_layer",
             "uint k = thread_position_in_grid.x, row = thread_position_in_grid.y; ulong n = p[0]; uint L = p[1], st = 1u << L;"
@@ -121,6 +123,23 @@ static Buf encode_array(const mx::array &coefficients, size_t rows, unsigned ld,
             {a, table, p}, {"a", "tw", "p"}, {{(int)rows, (int)n}}, n / 2, rows)[0];
     if (L % 4 == 0) mx::eval(a); // a chain of layers left lazy keeps them all in memory
   }
+  if (fused)
+    a = run("fp_layers_low", R"(
+      uint lid = thread_position_in_threadgroup.x; ulong blk = threadgroup_position_in_grid.x, n = p[0], nb = n >> 11, row = blk / nb, off = (blk % nb) << 11, base = row * n + off;
+      threadgroup ulong sh[2048];
+      for (uint i = lid; i < 2048; i += 256) sh[i] = a[base + i];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int L = 10; L >= 0; L--) {
+        ulong st = 1ul << L;
+        for (uint k = lid; k < 1024; k += 256) {
+          ulong h = k >> L, j = k & (st - 1), at = 2 * st * h + j, t = tw[(n >> (L + 1)) + (off >> (L + 1)) + h];
+          ulong u = sh[at], v = gl_mul(sh[at + st], t);
+          sh[at] = gl_add(u, v), sh[at + st] = gl_sub(u, v);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      for (uint i = lid; i < 2048; i += 256) out[base + i] = sh[i];)",
+            {a, table, words(std::vector<blk::u64>{n, 0, 0, 0, 0, 0, 0, 0})}, {"a", "tw", "p"}, {{(int)rows, (int)n}}, rows * (n >> 11) * 256)[0];
   return Buf(a);
 }
 // Each thread adds a stride of products; the partial sums end on the host. Sums in F are exact, so
