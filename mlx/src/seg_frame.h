@@ -38,12 +38,30 @@ inline std::vector<TableId> place_tables(ProverContext &P, const ReqLayout &lay,
     const OracleShape &o = msgs[mi].shape;
     if (!o.main_rows) { ids.push_back(NO_ID); continue; }
     Table t(o.main_deg, o.main_rows, codes.base[o.code].ell);
+    // The table's words are written on the GPU, block by block, and read back once.
+    mx::array words(mx::allocator::malloc(t.a.size() * 8), {(int)t.a.size()}, mx::uint64);
+    memset(words.data<uint64_t>(), 0, t.a.size() * 8);
+    std::vector<mx::array> done;
     for (const ReqArray &a : lay.link[link]) {
       if (a.message != mi) continue;
       auto it = arrays.find(a.name);
       if (it == arrays.end()) throw std::runtime_error("no array named " + a.name + " at link " + std::to_string(link));
-      for (const LaidBlock &b : a.laid.blocks) lay_block(t, b, it->second);
+      const ArrayData &d = it->second;
+      if (d.over_e && t.deg == 1) throw std::runtime_error("an array over E in a table over F");
+      const u64 *from = d.over_e ? reinterpret_cast<const u64 *>(d.e.data()) : reinterpret_cast<const u64 *>(d.f.data());
+      const size_t count = (d.over_e ? 3 : 1) * d.rows * d.columns;
+      std::vector<u64> pad(from, from + count);
+      pad.resize(std::max<size_t>(count, 8), 0);
+      const mx::array src(reinterpret_cast<const uint64_t *>(pad.data()), {(int)pad.size()}, mx::uint64);
+      for (const LaidBlock &b : a.laid.blocks) {
+        const u64 n = u64(1) << (b.bits_i + b.bits_c), place_mask = (u64(1) << b.place_bits) - 1;
+        BLK_REQUIRE(b.first_row + ((n - 1) >> b.place_bits) < t.rows && b.first_place + std::min(place_mask, n - 1) < t.len, "table: no such entry (rows beyond the real ones are zero and cannot be set)");
+        const u64 words8[8] = {b.first_i, b.first_c, b.first_row, b.first_place, b.bits_i, b.bits_c, b.place_bits, b.i_is_low};
+        done.push_back(fpmlx::lay_block(words, t.deg, t.len, src, d.over_e ? 3 : 1, d.columns, words8));
+      }
     }
+    mx::eval(done);
+    memcpy((void *)t.a.data(), words.data<uint64_t>(), t.a.size() * 8);
     ids.push_back(P.engine.put(t));
   }
   return ids;

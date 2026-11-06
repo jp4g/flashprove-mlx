@@ -106,6 +106,13 @@ mx::array lookup_leaves(const LeafPlan &p, const std::vector<blk::u64> &keys, co
 // A lookup's table side. Leaf i = (t | c | j). rows: by call, 2^kT row values each (the call's table
 // repeated); mult: by call, 2^kT counts. bits_rows: the two maps b and alpha - 1 - row, one after the other.
 TableSide lookup_table_side(unsigned kT, unsigned cK, unsigned NC, const std::vector<blk::u64> &rows, const std::vector<blk::u32> &mult, const blk::E &alpha, const blk::E &theta);
+// A matrix's cells packed three rows to a word: CellMatrix2::packed(), written out; out[i k + c], in F.
+Buf pack_cells(const int32_t *cells, size_t m, size_t k);
+// One LaidBlock of an array into a table's words, in place. src: words of F (deg 1) or E (deg 3).
+mx::array lay_block(const mx::array &table, unsigned table_deg, size_t len, const mx::array &src, unsigned src_deg, size_t columns, const blk::u64 *block /* first_i, first_c, first_row, first_place, bits_i, bits_c, place_bits, i_is_low */);
+// A matrix's combinations into the smallness test's digits: low and high keys at (u << lc) + off + i, ZZ
+// at u 2 mz + off + i and u 2 mz + mz + off + i. flag[0] is set if one has left its window. In place.
+mx::array digit_split(const mx::array &v, size_t m, size_t tau, size_t off, size_t mz, unsigned lc, const mx::array &low, const mx::array &high, const mx::array &pad, const mx::array &zz, const mx::array &flag);
 // Smallness::u3(): entry c nb + b is the sum over r < len of phi[r] cells[(b len + r) k + c].
 Buf column_sums(const int32_t *cells, size_t k, size_t nb, const std::vector<blk::E> &phi);
 // g^T M on a matrix of signed bytes, rows x columns.

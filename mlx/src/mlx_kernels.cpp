@@ -836,4 +836,33 @@ Buf matrix_left(const int8_t *matrix, size_t cells, size_t first, size_t rows, s
                  "e_st(out, x, s);",
                  {matrix_on_gpu(matrix, cells), e_array(g), words(std::vector<blk::u64>{columns, rows, first})}, {"ce", "g", "p"}, {{(int)(3 * columns)}}, columns)[0]);
 }
+Buf pack_cells(const int32_t *cells, size_t m, size_t k) {
+  const mx::array c(cells, {(int)(m * k)}, mx::int32);
+  const size_t rows = (m + 2) / 3;
+  return Buf(run("fp_pack_cells", R"(
+    ulong c = thread_position_in_grid.x, i = thread_position_in_grid.y, m = q[0], k = q[1]; long v = 0;
+    for (int d = 2; d >= 0; d--) { ulong r = 3 * i + d; v = v * (1l << 20) + (r < m ? (long)ce[r * k + c] : 0l); }
+    out[i * k + c] = v < 0 ? gl_neg(gl_canonical((ulong)(-v))) : gl_canonical((ulong)v);)",
+    {c, words(std::vector<blk::u64>{m, k, 0, 0, 0, 0, 0, 0})}, {"ce", "q"}, {{(int)(rows * k)}}, k, rows)[0]);
+}
+mx::array lay_block(const mx::array &table, unsigned td, size_t len, const mx::array &src, unsigned sd, size_t columns, const blk::u64 *b) {
+  std::vector<blk::u64> p = {td, len, sd, columns};
+  p.insert(p.end(), b, b + 8);
+  return run("fp_lay_block", R"(
+    ulong x = thread_position_in_grid.x, td = q[0], len = q[1], sd = q[2], cols = q[3], fi = q[4], fc = q[5], fr = q[6], fp = q[7], bi = q[8], bc = q[9], pb = q[10], low = q[11], i, c;
+    if (low) i = x & ((1ul << bi) - 1), c = x >> bi; else c = x & ((1ul << bc) - 1), i = x >> bc;
+    ulong row = fr + (x >> pb), place = fp + (x & ((1ul << pb) - 1)), at = ((fi + i) * cols + fc + c) * sd, to = (row * len + place) * td;
+    device ulong *T = (device ulong *)t;
+    T[to] = s[at];
+    if (td == 3) { T[to + 1] = sd == 3 ? s[at + 1] : 0; T[to + 2] = sd == 3 ? s[at + 2] : 0; })", {table, src, words(p)}, {"t", "s", "q"}, {{1}}, size_t(1) << (b[4] + b[5]))[0];
+}
+mx::array digit_split(const mx::array &v, size_t m, size_t tau, size_t off, size_t mz, unsigned lc, const mx::array &low, const mx::array &high, const mx::array &pad, const mx::array &zz, const mx::array &flag) {
+  return run("fp_digit_split", R"(
+    ulong i = thread_position_in_grid.x, u = thread_position_in_grid.y, m = q[0], off = q[1], mz = q[2], lc = q[3], value = w[u * m + i];
+    if (value == ~0ul) { ((device ulong *)fl)[0] = 1; return; }
+    ulong at = (u << lc) + off + i, lo = value & 1023, hi = (value >> 10) & 0xFFFFFF, cols = 2 * mz;
+    ((device ulong *)kl)[at] = lo, ((device ulong *)kh)[at] = hi, ((device uchar *)pd)[at] = 0;
+    ((device ulong *)z)[u * cols + off + i] = lo, ((device ulong *)z)[u * cols + mz + off + i] = hi;)",
+    {v, low, high, pad, zz, flag, words(std::vector<blk::u64>{m, off, mz, lc, 0, 0, 0, 0})}, {"w", "kl", "kh", "pd", "z", "fl", "q"}, {{1}}, m, tau)[0];
+}
 }

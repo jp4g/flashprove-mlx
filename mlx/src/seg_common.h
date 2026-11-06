@@ -92,8 +92,8 @@ inline ArrayData array_of(const CellMatrix2 &M) {
   ArrayData a;
   a.rows = M.packed_rows(), a.columns = M.k;
   a.f.resize(a.rows * a.columns);
-  for (u64 i = 0; i < a.rows; i++)
-    for (u64 c = 0; c < a.columns; c++) a.f[i * a.columns + c] = M.packed(i, c);
+  const Buf w = pack_cells(M.cell.data(), M.m, M.k);
+  memcpy((void *)a.f.data(), w.data(), a.f.size() * 8);
   return a;
 }
 // Places arrays in the main table of an oracle message, by the layout's blocks.
@@ -145,36 +145,29 @@ public:
     mz_ = mz;
     ZZ = ArrayData();
     ZZ.rows = tau, ZZ.columns = 2 * mz, ZZ.f.assign(ZZ.rows * ZZ.columns, F{0});
-    low_.assign(tau * mz, 0), high_.assign(tau * mz, 0);
-    u64 off = 0;
-    bool fits = true;
-    for (auto *M : mats) {
-      const Buf v = combinations(M->cell.data(), M->m, M->k, theta_.data() + col0 * tau, tau);
-      const u64 *w = v.data();
-      psc_parallel(tau * M->m, [&](size_t a, size_t e) {
-        for (size_t x = a; x < e; x++) {
-          const u64 u = x / M->m, i = x % M->m, value = w[x];
-          low_[u * mz + off + i] = (u32)(value & 1023), high_[u * mz + off + i] = (u32)((value >> 10) & 0xFFFFFF);
-          ZZ.f[u * ZZ.columns + off + i] = from_u64(value & 1023);
-          ZZ.f[u * ZZ.columns + mz + off + i] = from_u64((value >> 10) & 0xFFFFFF);
-        }
-      });
-      for (size_t x = 0; x < tau * M->m; x++) fits = fits && w[x] != ~u64(0);
-      off += M->m, col0 += M->k;
-    }
-    if (!fits) return false;
     lc_ = clog2u(mz);
     n_ = std::max(10u, clog2u(tau) + lc_);
+    const size_t nk = size_t(1) << n_;
+    auto buffer = [](size_t bytes, mx::Dtype t, int fill) { mx::array x(mx::allocator::malloc(bytes), {(int)(bytes / mx::size_of(t))}, t); memset(x.data<uint8_t>(), fill, bytes); return x; };
+    mx::array kl = buffer(nk * 8, mx::uint64, 0), kh = buffer(nk * 8, mx::uint64, 0), pad = buffer(nk, mx::uint8, 1), zz = buffer(ZZ.f.size() * 8, mx::uint64, 0), flag = buffer(64, mx::uint64, 0);
+    std::vector<mx::array> done;
+    std::vector<Buf> kept;
+    u64 off = 0;
+    for (auto *M : mats) {
+      kept.push_back(combinations(M->cell.data(), M->m, M->k, theta_.data() + col0 * tau, tau));
+      done.push_back(digit_split(kept.back().array(), M->m, tau, off, mz, lc_, kl, kh, pad, zz, flag));
+      off += M->m, col0 += M->k;
+    }
+    mx::eval(done);
+    if (flag.data<uint64_t>()[0]) return false;
+    memcpy((void *)ZZ.f.data(), zz.data<uint64_t>(), ZZ.f.size() * 8);
     calls_.assign(2, LookupCall());
     for (unsigned q = 0; q < 2; q++) {
       LookupCall &L = calls_[q];
       L.n = n_, L.k = q ? 8 : 10, L.t0 = 0;
-      L.keys.assign(u64(1) << n_, 0), L.padding.assign(u64(1) << n_, 1);
-      for (u64 u = 0; u < tau; u++)
-        for (u64 c = 0; c < mz; c++) {
-          const u64 x = (u << lc_) + c;
-          L.keys[x] = q ? high_[u * mz + c] : low_[u * mz + c], L.padding[x] = 0;
-        }
+      L.keys.resize(nk), L.padding.resize(nk);
+      memcpy(L.keys.data(), (q ? kh : kl).data<uint64_t>(), nk * 8);
+      memcpy(L.padding.data(), pad.data<uint8_t>(), nk);
     }
     sizes_ = lookup_sizes(calls_, lidb);
     if (!lookup_multiplicities(calls_, sizes_, mult_)) return false;
@@ -192,7 +185,6 @@ public:
   LookupOut run_lookup(Chan &ch, const E *mask, u32 &slot) { return lookup_run(ch, mask, slot, calls_, sizes_, mult_); }
 private:
   std::vector<signed char> theta_;
-  std::vector<u32> low_, high_;
   std::vector<LookupCall> calls_;
   LookupSizes sizes_;
   std::vector<std::vector<u32>> mult_;

@@ -81,8 +81,9 @@ inline std::vector<E> interpolate(const std::vector<E> &v) {
   }
   return out;
 }
-// From this many values of a map, the rounds run on the GPU; below it a round's launch costs more than
-// the round. FP_PSC_GPU_MIN sets it: 0 keeps every round on the CPU.
+// From this many values of a map, the rounds run on the GPU. Measured, three proofs each, segments' sum:
+// 7.7 s at 512, 7.6 s at 2048, 7.7 s at 8192, 8.9 s at 32768, 9.4 s at 131072. FP_PSC_GPU_MIN sets it: 0
+// keeps every round on the CPU.
 inline size_t &psc_gpu_min() {
   static size_t v = [] { const char *e = getenv("FP_PSC_GPU_MIN"); return e ? (size_t)strtoull(e, nullptr, 10) : size_t(1) << 13; }();
   return v;
