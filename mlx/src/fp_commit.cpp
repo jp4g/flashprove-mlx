@@ -60,13 +60,16 @@ int main(int argc, char **argv) {
     const NonceSearch search = [&](const ChainPrefix &p, unsigned bits) { return engine.search_nonce(p, bits); };
     if (getenv("FP_STOP_AFTER_TABLE")) { fpmlx::IndexMlx t(S, M, *coins, c.configuration()); printf("table only: %.1f s\n", now() - t0); return 0; }
     fpmlx::IndexMlx first(S, M, *coins, c.configuration());
+    auto memory = [](const char *at) { printf("GPU memory after %s: active %.2f GB, peak %.2f GB, cache %.2f GB\n", at, fpmlx::mx::get_active_memory() / 1e9, fpmlx::mx::get_peak_memory() / 1e9, fpmlx::mx::get_cache_memory() / 1e9); };
     printf("anchor table: %.1f s\n", now() - t0); fflush(stdout);
+    memory("the anchor table");
     fpmlx::WfMlx ranges(f.ranges, wf_matrix_of(S), cells, raw.size(), columns);
     fpmlx::MemberMlx products(S, M);
     Writer key;
     const double t1 = now();
     if (!make_key(c, first, ranges, products, engine, *key_coins, search, key)) { fprintf(stderr, "fp_commit: make_key failed: a cell is out of its range\n"); return 3; }
     printf("key file: %zu bytes, %.1f s\n", key.bytes().size(), now() - t1); fflush(stdout);
+    memory("the key file");
     const double t2 = now();
     fpmlx::IndexMlx further(S, M, *leaf_coins, c.configuration());
     const fpmlx::SpentLedger ledger(std::string(argv[4]) + ".spent");
@@ -75,6 +78,7 @@ int main(int argc, char **argv) {
     Writer entry;
     if (!make_entry(c, first, further, engine, *link_coins, search, entry)) { fprintf(stderr, "fp_commit: make_entry failed\n"); return 3; }
     printf("leaf file: %zu bytes, %.1f s\n", entry.bytes().size(), now() - t2);
+    memory("the leaf file");
     mkdir(out.c_str(), 0700);
     mkdir((out + "/leaf").c_str(), 0700);
     spit(out + "/key.bin", key.bytes());

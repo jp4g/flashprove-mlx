@@ -119,6 +119,7 @@ static Buf encode_array(const mx::array &coefficients, size_t rows, unsigned ld,
             "ulong u = a[base], v = gl_mul(a[base + st], t);"
             "out[base] = gl_add(u, v); out[base + st] = gl_sub(u, v);",
             {a, table, p}, {"a", "tw", "p"}, {{(int)rows, (int)n}}, n / 2, rows)[0];
+    if (L % 4 == 0) mx::eval(a); // a chain of layers left lazy keeps them all in memory
   }
   return Buf(a);
 }
