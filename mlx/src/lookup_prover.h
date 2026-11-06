@@ -117,22 +117,16 @@ template <class Ch> LookupOut lookup_run(Ch &ch, const E *mask, u32 &slot, const
   // The table side: leaves (t | c | j).
   const unsigned nT = 5 + s.dL;
   std::vector<mx::array> Tt;
-  std::vector<E> bits(size_t(1) << nT, E::zero()), rowA(size_t(1) << nT);
-  for (u64 t = 0; t < (u64(1) << s.kT); t++)
-    for (u64 c = 0; c < (u64(1) << s.cK); c++) {
-      const unsigned cc = std::min<u64>(c, s.NC - 1);
-      const E rv = keyed(cc, calls[cc].row(t & ((u64(1) << calls[cc].k) - 1)));
-      for (unsigned j = 0; j < 32; j++) {
-        const size_t i = ((t << s.cK | c) << 5) | j;
-        rowA[i] = alpha - E::one() - rv;
-        if (c < s.NC && ((mult[c][t] >> j) & 1)) bits[i] = E::one();
-      }
-    }
+  std::shared_ptr<mx::array> bits_rows;
   {
-    std::vector<E> leaves(size_t(1) << nT);
-    psc_parallel(leaves.size(), [&](size_t a, size_t e) { for (size_t i = a; i < e; i++) leaves[i] = E::one() + bits[i] * rowA[i]; });
+    std::vector<u64> rows((size_t)s.NC << s.kT);
+    std::vector<u32> counts((size_t)s.NC << s.kT);
+    for (unsigned c = 0; c < s.NC; c++)
+      for (u64 t = 0; t < (u64(1) << s.kT); t++) rows[(c << s.kT) + t] = calls[c].row(t & ((u64(1) << calls[c].k) - 1)), counts[(c << s.kT) + t] = mult[c][t];
+    TableSide side = lookup_table_side(s.kT, s.cK, s.NC, rows, counts, alpha, theta);
+    bits_rows = std::make_shared<mx::array>(side.bits_rows);
     Tt.assign(nT + 1, mx::array(0));
-    Tt[nT] = e_on_gpu(leaves);
+    Tt[nT] = side.leaves;
     for (int m = (int)nT - 1; m >= 5; m--) Tt[m] = product_level(Tt[m + 1]);
   }
   const std::vector<E> G = e_fetch(Tt[5]);
@@ -225,7 +219,7 @@ template <class Ch> LookupOut lookup_run(Ch &ch, const E *mask, u32 &slot, const
   // Step 7.
   {
     PscJob j;
-    j.maps = {bits, rowA};
+    j.device = bits_rows, j.device_maps = 2;
     j.summand = {{E::one(), {}}, {E::one(), {0, 1}}};
     for (unsigned l = 0; l < nT; l++) j.vars.push_back({Weight<E>::equality(zT[l], l < s.dL ? 3 : 2), nT - 1 - l});
     j.start_value = CT, j.start_public = CTpub;
@@ -238,7 +232,8 @@ template <class Ch> LookupOut lookup_run(Ch &ch, const E *mask, u32 &slot, const
     std::vector<E> zq = ch.point_zero(nT);
     std::reverse(zq.begin(), zq.end());
     PscJob j;
-    j.maps = {bits};
+    j.device = std::make_shared<mx::array>(mx::slice(*bits_rows, {0}, {(int)(bits_rows->size() / 2)}));
+    j.device_maps = 1;
     j.shown = 1, j.degree_y = 2;
     j.summand = {{E::one(), {0, 0}}, {E::zero() - E::one(), {0}}};
     for (unsigned l = 0; l < nT; l++) j.vars.push_back({Weight<E>::equality(zq[l], 3), nT - 1 - l});

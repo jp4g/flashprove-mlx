@@ -81,6 +81,7 @@ std::vector<blk::E> e_download(const Buf &a) {
   if (!out.empty()) memcpy((void *)out.data(), a.data(), a.size() * 8);
   return out;
 }
+static Buf encode_array(const mx::array &coefficients, size_t rows, unsigned ld, unsigned log_n, const blk::F *tw);
 Buf encode_rows(const blk::u64 *coefficients, size_t rows, unsigned ld, unsigned log_n, const blk::F *tw) {
   const size_t block = size_t(1) << ld, n = size_t(1) << log_n;
   if (in_forked_child()) {
@@ -100,9 +101,13 @@ Buf encode_rows(const blk::u64 *coefficients, size_t rows, unsigned ld, unsigned
     }
     return Buf(std::move(w));
   }
+  return encode_array(words(coefficients, rows * block), rows, ld, log_n, tw);
+}
+static Buf encode_array(const mx::array &coefficients, size_t rows, unsigned ld, unsigned log_n, const blk::F *tw) {
+  const size_t block = size_t(1) << ld, n = size_t(1) << log_n;
   const mx::array table = words(reinterpret_cast<const blk::u64 *>(tw), n);
   mx::array a = run("fp_spread", "uint x = thread_position_in_grid.x, row = thread_position_in_grid.y; ulong n = p[0], block = p[1]; out[row * n + x] = c[row * block + (x & (block - 1))];",
-                    {words(coefficients, rows * block), words(std::vector<blk::u64>{n, block})}, {"c", "p"}, {{(int)rows, (int)n}}, n, rows)[0];
+                    {coefficients, words(std::vector<blk::u64>{n, block})}, {"c", "p"}, {{(int)rows, (int)n}}, n, rows)[0];
   for (unsigned L = ld; L-- > 0;) {
     const mx::array p = words(std::vector<blk::u64>{n, L});
     a = run("fp_layer",
@@ -656,5 +661,62 @@ Buf bytes_left(const int8_t *cells, size_t rows, size_t columns, const std::vect
                  "for (ulong y = 0; y < rows; y++) { long v = ce[y * columns + x]; if (v) s = e_add(s, e_scale(e_ld(g, y), v < 0 ? GL_P - (ulong)(-v) : (ulong)v)); }"
                  "e_st(out, x, s);",
                  {c, e_array(g), words(std::vector<blk::u64>{columns, rows})}, {"ce", "g", "p"}, {{(int)(3 * columns)}}, columns)[0]);
+}
+TableWords table_words(const blk::Table &t) {
+  TableWords w;
+  w.deg = t.deg, w.log_rows = t.log_rows, w.rows = t.rows, w.len = t.len;
+  const blk::u64 *p = reinterpret_cast<const blk::u64 *>(t.a.data());
+  w.a = t.a.empty() ? Buf(words(std::vector<blk::u64>(8, 0))) : Buf(words(p, t.a.size()));
+  return w;
+}
+blk::E dot_table(const Buf &W, const TableWords &t) {
+  const size_t n = t.len << t.log_rows, T = std::min<size_t>(n, 1 << 16);
+  const mx::array p = run("fp_dot_table", R"(
+    ulong i = thread_position_in_grid.x, T = q[0], n = q[1], deg = q[2], lr = q[3], rows = q[4], len = q[5]; GlE s = {0, 0, 0};
+    for (ulong j = i; j < n; j += T) {
+      ulong row = j & ((1ul << lr) - 1), place = j >> lr;
+      if (row >= rows) continue;
+      ulong at = (row * len + place) * deg;
+      GlE x = deg == 1 ? GlE{a[at], 0, 0} : GlE{a[at], a[at + 1], a[at + 2]};
+      s = e_add(s, e_mul(e_ld(w, j), x));
+    }
+    e_st(out, i, s);)", {W.array(), t.a.array(), words(std::vector<blk::u64>{T, n, t.deg, t.log_rows, t.rows, t.len})}, {"w", "a", "q"}, {{(int)(3 * T)}}, T)[0];
+  return sum_partials(p, T, 0, 3);
+}
+mx::array e_rows_buffer(size_t entries) {
+  mx::array a(mx::allocator::malloc(entries * 24), {(int)(3 * entries)}, mx::uint64);
+  memset(a.data<uint64_t>(), 0, entries * 24);
+  return a;
+}
+mx::array put_rows(const mx::array &o, const TableWords &t, size_t first) {
+  return run("fp_put_rows", R"(
+    ulong i = thread_position_in_grid.x, b = thread_position_in_grid.y, deg = q[0], len = q[1], first = q[2], at = (b * len + i) * deg;
+    GlE x = deg == 1 ? GlE{a[at], 0, 0} : GlE{a[at], a[at + 1], a[at + 2]};
+    e_st((device ulong *)o, (first + b) * len + i, x);)", {o, t.a.array(), words(std::vector<blk::u64>{t.deg, t.len, first})}, {"o", "a", "q"}, {{1}}, t.len, t.rows)[0];
+}
+Buf encode_table(const TableWords &m, const TableWords &tl, size_t message_at, size_t tail_at, size_t ell, size_t r, unsigned ld, unsigned log_n, const blk::F *tw) {
+  const size_t block = size_t(1) << ld, rows = m.rows * m.deg;
+  const mx::array c = run("fp_coefficients", R"(
+    ulong x = thread_position_in_grid.x, row = thread_position_in_grid.y, deg = q[0], ell = q[1], r = q[2], ma = q[3], ta = q[4], block = q[5], b = row / deg, d = row % deg, v = 0;
+    if (x >= ma && x < ma + ell) v = a[(b * ell + x - ma) * deg + d];
+    else if (x >= ta && x < ta + r) v = tl[(b * r + x - ta) * deg + d];
+    out[row * block + x] = v;)", {m.a.array(), tl.a.array(), words(std::vector<blk::u64>{m.deg, ell, r, message_at, tail_at, block})}, {"a", "tl", "q"}, {{(int)(rows * block)}}, block, rows)[0];
+  return encode_array(c, rows, ld, log_n, tw);
+}
+TableSide lookup_table_side(unsigned kT, unsigned cK, unsigned NC, const std::vector<blk::u64> &rows, const std::vector<blk::u32> &mult, const blk::E &alpha, const blk::E &theta) {
+  const unsigned nT = 5 + kT + cK;
+  const size_t n = size_t(1) << nT;
+  std::vector<blk::u64> p = {cK, NC, kT, n};
+  for (const blk::E &e : {alpha, theta}) for (blk::u64 c : e_words(e)) p.push_back(c);
+  std::vector<blk::u64> m64(mult.begin(), mult.end());
+  const mx::array bits_rows = run("fp_lookup_table", R"(
+    ulong i = thread_position_in_grid.x, cK = p[0], NC = p[1], kT = p[2], n = p[3], j = i & 31, c = (i >> 5) & ((1ul << cK) - 1), t = i >> (5 + cK), cc = min(c, NC - 1);
+    GlE theta = {p[7], p[8], p[9]}, keyed = e_scale(theta, cc);
+    keyed.c0 = gl_add(keyed.c0, gl_canonical(rw[(cc << kT) + t]));
+    e_st(out, i, GlE{(c < NC && ((mu[(c << kT) + t] >> j) & 1)) ? 1ul : 0ul, 0, 0});
+    e_st(out, n + i, e_sub(e_sub(GlE{p[4], p[5], p[6]}, GlE{1, 0, 0}), keyed));)", {words(rows), words(m64), words(p)}, {"rw", "mu", "p"}, {{(int)(6 * n)}}, n)[0];
+  const mx::array leaves = run("fp_lookup_table_leaves", "ulong i = thread_position_in_grid.x, n = p[0]; e_st(out, i, e_add(GlE{1, 0, 0}, e_mul(e_ld(a, i), e_ld(a, n + i))));",
+                               {bits_rows, words(std::vector<blk::u64>{n})}, {"a", "p"}, {{(int)(3 * n)}}, n)[0];
+  return {bits_rows, leaves};
 }
 }

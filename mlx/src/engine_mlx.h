@@ -255,8 +255,12 @@ public:
     const Code &code = committed(parts[0].commit).parts[parts[0].part].code;
     const size_t rows = size_t(1) << k;
     f->ell = code.ell, f->r = code.r, f->rows = rows;
-    f->m.assign(rows * f->ell, E::zero());
-    f->tail.assign(rows * f->r, E::zero());
+    // On the GPU a fold's rows are gathered from its tables' words; a tiny one is not worth it.
+    const bool gather = !fpmlx::in_forked_child() && rows * f->ell >= 8 && rows * f->r >= 8;
+    fpmlx::mx::array gm(0), gt(0);
+    std::vector<fpmlx::mx::array> gathered;
+    if (gather) gm = fpmlx::e_rows_buffer(rows * f->ell), gt = fpmlx::e_rows_buffer(rows * f->r);
+    else f->m.assign(rows * f->ell, E::zero()), f->tail.assign(rows * f->r, E::zero());
     std::vector<bool> taken(rows, false);
     for (const FoldPart &p : parts) {
       f->over.push_back(p.commit);
@@ -271,7 +275,10 @@ public:
         BLK_REQUIRE(!taken[p.first_row + b], "fold: two parts on the same rows");
         taken[p.first_row + b] = true;
       }
-      for (size_t b = 0; b < m.rows; b++) {
+      if (gather) {
+        gathered.push_back(fpmlx::put_rows(gm, fpmlx::table_words(m), p.first_row));
+        gathered.push_back(fpmlx::put_rows(gt, fpmlx::table_words(cm.tail[p.part]), p.first_row));
+      } else for (size_t b = 0; b < m.rows; b++) {
         for (size_t i = 0; i < f->ell; i++) f->m[(p.first_row + b) * f->ell + i] = m.at(b, i);
         for (size_t i = 0; i < f->r; i++) f->tail[(p.first_row + b) * f->r + i] = cm.tail[p.part].at(b, i);
       }
@@ -284,7 +291,8 @@ public:
     for (const EngineTerm &t : c.engine_terms) f->hinted.push_back(t.vector);
     for (const Tensor &v : c.tensors)
       if (v.is_held()) f->hinted.push_back(v.held);  // a dense factor stored in a table
-    f->gm = fpmlx::e_upload(f->m);
+    if (gather) fpmlx::mx::eval(gathered), f->gm = fpmlx::Buf(gm), f->gt = fpmlx::Buf(gt);
+    else f->gm = fpmlx::e_upload(f->m), f->gt = fpmlx::e_upload(f->tail);
     if (dense.on_gpu()) f->gc = fpmlx::rows_first(dense, rows, f->ell);
     else {
       const E *d = reinterpret_cast<const E *>(dense.data());
@@ -293,7 +301,6 @@ public:
         for (size_t i = 0; i < f->ell; i++) cc[b * f->ell + i] = d[b + rows * i];
       f->gc = fpmlx::e_upload(cc);
     }
-    f->gt = fpmlx::e_upload(f->tail);
     f->m.clear(), f->tail.clear();
     folds_.push_back(std::move(f));
     return (FoldId)(folds_.size() - 1);
@@ -437,6 +444,10 @@ private:
     out.n = size_t(1) << code.log_n;
     out.rows = msg.rows * msg.deg;
     const size_t block = size_t(1) << code.log_dim();
+    if (!fpmlx::in_forked_child() && msg.rows) {
+      out.a = fpmlx::encode_table(fpmlx::table_words(msg), fpmlx::table_words(tail), code.message_at(), code.tail_at(), code.ell, code.r, code.log_dim(), code.log_n, transform_table(code.log_n)->data());
+      return out;
+    }
     std::vector<u64> coefficients(out.rows * block, 0);
     for (size_t b = 0; b < msg.rows; b++)
       for (unsigned d = 0; d < msg.deg; d++) {
@@ -463,11 +474,14 @@ private:
     column(c.mask, c.shape.has_main() ? short_position(c.shape.log_n, c.shape.log_n_zk, x) : x, col);
     (void)main_width;
   }
-  static E dot_with_table(const std::vector<E> &w, const Table &t) { return dot_with_table(fpmlx::e_upload(w), t); }
-  static E dot_with_table(const fpmlx::Buf &w, const Table &t) {
-    std::vector<E> entries(t.entries());
-    for (u64 j = 0; j < t.entries(); j++) entries[j] = t.entry(j);
-    return fpmlx::dot(w, fpmlx::e_upload(entries));
+  E dot_with_table(const std::vector<E> &w, const Table &t) { return dot_with_table(fpmlx::e_upload(w), t); }
+  E dot_with_table(const fpmlx::Buf &w, const Table &t) {
+    if (fpmlx::in_forked_child() || !w.on_gpu()) {
+      std::vector<E> entries(t.entries());
+      for (u64 j = 0; j < t.entries(); j++) entries[j] = t.entry(j);
+      return fpmlx::dot(w, fpmlx::e_upload(entries));
+    }
+    return fpmlx::dot_table(w, fpmlx::table_words(t));
   }
   // table() and committed() follow a loan to the lender; own_table() and own_tree() do not.
   Table &table(TableId t) {

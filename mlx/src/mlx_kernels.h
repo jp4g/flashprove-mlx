@@ -55,6 +55,17 @@ Buf combinations(const int32_t *cells, size_t m, size_t k, const signed char *th
 // The sum of Tensors written out, 2^vars entries of E, each thread summing one entry. The words may be
 // changed by the caller until the Buf is given to a kernel.
 Buf tensors_written(const std::vector<blk::Tensor> &tensors, unsigned vars);
+// Tables on the GPU: the words of a blk::Table, a[(row * len + place) * deg + coordinate].
+struct TableWords { Buf a; unsigned deg = 1, log_rows = 0; size_t rows = 0, len = 0; };
+TableWords table_words(const blk::Table &t);
+// sum_j w[j] entry(j), entry() as blk::Table's.
+blk::E dot_table(const Buf &w, const TableWords &t);
+// A block of table rows into a fold's rows of E: out[(first + b) len + i], in place; out stays a Buf whose
+// array is given to the next kernel. Returns a token for the order of the kernels.
+mx::array e_rows_buffer(size_t entries);
+mx::array put_rows(const mx::array &out, const TableWords &t, size_t first_row);
+// The coefficients of rows from a message and a tail, then the encoding: EngineCpu's encode on every row.
+Buf encode_table(const TableWords &msg, const TableWords &tail, size_t message_at, size_t tail_at, size_t ell, size_t r, unsigned log_dim, unsigned log_n, const blk::F *tw);
 // entry b + rows i of `dense` to place b ell + i, for b < rows, i < ell.
 Buf rows_first(const Buf &dense, size_t rows, size_t ell);
 // A lookup's product trees. Level m has 2^m vertices; a vertex is the product of two of the level below,
@@ -71,6 +82,10 @@ struct LeafPlan {
   std::vector<blk::u64> pad_value;             // by call: the value of the padding row
 };
 mx::array lookup_leaves(const LeafPlan &p, const std::vector<blk::u64> &keys, const std::vector<char> &padding);
+// A lookup's table side. Leaf i = (t | c | j). rows: by call, 2^kT row values each (the call's table
+// repeated); mult: by call, 2^kT counts. bits_rows: the two maps b and alpha - 1 - row, one after the other.
+struct TableSide { mx::array bits_rows, leaves; };
+TableSide lookup_table_side(unsigned kT, unsigned cK, unsigned NC, const std::vector<blk::u64> &rows, const std::vector<blk::u32> &mult, const blk::E &alpha, const blk::E &theta);
 // Smallness::u3(): entry c nb + b is the sum over r < len of phi[r] cells[(b len + r) k + c].
 Buf column_sums(const int32_t *cells, size_t k, size_t nb, const std::vector<blk::E> &phi);
 // g^T M on a matrix of signed bytes, rows x columns.
