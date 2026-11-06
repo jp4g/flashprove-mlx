@@ -7,7 +7,7 @@ mlx/demo.sh ~/fpwork/demo
 ```
 
 It needs `.venv` with `mlx`, Homebrew's `gcc`, `llvm` and GNU tools. See `MLX_PORT_STATUS.md` for what
-was measured and for the limits: the work that grows with the model runs on Metal, and witness assembly is still host code.
+was measured and for the limits: the heavy proof loops run on Metal; witness assembly and some smaller steps are still host code.
 
 # FlashProve on MLX: reproducing the results
 

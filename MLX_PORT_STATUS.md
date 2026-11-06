@@ -1,9 +1,9 @@
 # MLX port: status
 
 Branch `mlx-port`. **Milestone 1's chain works: a request on the bundled synthetic model is proved by
-the native prover and the unmodified `bin/cp_verify` answers `YES`. The work that grows with the model
-now runs on Metal; a proof takes 21 s, of which about 11 s is CPU time.** What is still host code is
-listed under the limits. SmolLM2 is no longer the end goal, by the owner's decision of 2026-11-05, and
+the native prover and the unmodified `bin/cp_verify` answers `YES`. The heavy proof loops now run on
+Metal, but not all work that grows with the model does: witness assembly is still host code. A proof
+takes 21 s, with about 11 s of user CPU time.** What is still host code is listed under the limits. SmolLM2 is no longer the end goal, by the owner's decision of 2026-11-05, and
 nothing of it is built. Everything below is measured on an Apple M5 Pro (64 GB, macOS 27), MLX 0.32.4.
 
 ## The result
