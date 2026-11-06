@@ -50,6 +50,7 @@ With one seed, the moved `fp_commit` wrote every file of the commitment byte for
 | `psc_gpu_test` | every sent word, challenge and end value of a sumcheck, on 288 configurations; a deliberately wrong bind kernel made 234 of 252 differ | 288 of 288 equal |
 | `form_gpu_test` | `tensors_written` against `Tensor::add_to` | 36 of 36 equal |
 | `coins_gpu_test` | `MetalCoins` against `StreamCoins`, short and long draws | 9 of 9 equal |
+| `ledger_test` | the table's count: survives runs, stops at the limit, refuses when damaged, eight provers at once | all hold |
 | `kernels_gpu_test` | combinations, column sums, `g^T M`, product levels, lookup leaves, transpose | 6 of 6 equal |
 
 ## Limits of this result
@@ -66,9 +67,10 @@ With one seed, the moved `fp_commit` wrote every file of the commitment byte for
 - **The companion:** `fp_prove` needs a patched build of the verifier running beside it, for each
   segment's equation and public parts. It is a helper of the prover. It decides nothing: the judge is
   the stock `cp_verify`, built without those patches.
-- **The table's budget is not kept:** a table allows a limited number of batches, and `lin_begin` counts
-  them in memory. `fp_prove` rebuilds the table each run, so the count starts again. Too many proofs on
-  one leaf table would open more columns than its masks cover. Fine for synthetic weights only.
+- **The table's budget:** a leaf table hides 65,535 opened columns, and a proof opens 51, so it allows
+  1,285 batches, `make_entry`'s among them. The count is in `<seed file>.spent`, raised and flushed before
+  any column is opened, under a lock. `fp_prove` refuses if that file is missing or damaged, and at the
+  limit (exit 3). Deleting or restoring the file defeats it: nothing but the operator's care protects it.
 - **The seed file** re-derives the leaf table's random entries and is secret.
 - Paths that this model never reaches are untested: `e < T`, a cost above C, `v >= V` padding, more than
   one part of `hf`. Five limbs alone are served.
@@ -105,7 +107,6 @@ survive a fork), so those children exercise the engine's guards, not its kernels
 
 - Moving the witness assembly to Metal. By profile the wall time is now mostly GPU work: the coefficient
   vectors, encoding (each layer is a pass over memory), the nonce search.
-- Keeping a table's batch count between runs.
 - Why `fp_commit` still peaks at 61 GB.
 - A CLI beyond `fp_commit`, `fp_prove` and `mlx/demo.sh`; benchmarks over repeated runs.
 - SmolLM2: dropped as the end goal. A separate verifier variant would be needed for it.

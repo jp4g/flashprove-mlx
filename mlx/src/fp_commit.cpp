@@ -69,6 +69,9 @@ int main(int argc, char **argv) {
     printf("key file: %zu bytes, %.1f s\n", key.bytes().size(), now() - t1); fflush(stdout);
     const double t2 = now();
     fpmlx::IndexMlx further(S, M, *leaf_coins, c.configuration());
+    const fpmlx::SpentLedger ledger(std::string(argv[4]) + ".spent");
+    if (!ledger.create()) { fprintf(stderr, "fp_commit: cannot make %s.spent\n", argv[4]); return 2; }
+    further.keep_count_in(ledger);
     Writer entry;
     if (!make_entry(c, first, further, engine, *link_coins, search, entry)) { fprintf(stderr, "fp_commit: make_entry failed\n"); return 3; }
     printf("leaf file: %zu bytes, %.1f s\n", entry.bytes().size(), now() - t2);

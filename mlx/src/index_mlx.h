@@ -10,6 +10,7 @@
 #include "iop/lin.h"
 #include "iop/member.h"
 #include "mlx_kernels.h"
+#include "spent_ledger.h"
 namespace fpmlx {
 using namespace blk;
 struct CellMatrix { u64 rows, columns; const int8_t *cells; };
@@ -71,8 +72,17 @@ public:
     });
     return rec;
   }
+  // From here on the count of opened columns is the ledger's, which outlives this object.
+  void keep_count_in(const SpentLedger &ledger) { ledger_ = std::make_unique<SpentLedger>(ledger); }
   bool begin(u64 columns) override {
-    if (columns > hiding_positions(shape_.code) - spent_) return false;
+    const u64 limit = hiding_positions(shape_.code);
+    if (ledger_) {
+      unsigned long long now = 0;
+      if (!ledger_->spend(columns, limit, &now)) return false;
+      printf("table: %llu of %llu columns spent\n", now, (unsigned long long)limit);
+      return true;
+    }
+    if (columns > limit - spent_) return false;
     spent_ += columns;
     return true;
   }
@@ -115,6 +125,7 @@ private:
   u64 each_ = 1;
   std::unique_ptr<OracleTreeMlx> tree_;
   u64 spent_ = 0;
+  std::unique_ptr<SpentLedger> ledger_;
 };
 // W_j = g_j^T M on the byte matrix.
 class MemberMlx : public MemberHeavy {

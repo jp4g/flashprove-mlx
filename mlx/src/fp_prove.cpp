@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <csignal>
 #include <spawn.h>
 #include <sstream>
 #include <sys/stat.h>
@@ -29,6 +30,13 @@ static std::string slurp(const std::string &p) {
   std::stringstream s;
   s << f.rdbuf();
   return s.str();
+}
+static volatile pid_t companion_group = 0;
+static void stop_companion() { if (companion_group > 0) kill(-companion_group, SIGKILL); }
+static void on_fatal_signal(int s) {
+  stop_companion();
+  signal(s, SIG_DFL);
+  raise(s);
 }
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 int main(int argc, char **argv) {
@@ -57,6 +65,7 @@ int main(int argc, char **argv) {
   const std::string dir = outp + ".work";
   mkdir(dir.c_str(), 0700);
   const std::string spath = dir + "/stream.bin", mark = dir + "/mark.proof", yf = dir + "/y";
+  unlink(spath.c_str()); // a new file: whatever an earlier run left behind can no longer reach this stream
   uint8_t *m = fpstream::map(spath.c_str(), true);
   if (!m) { fprintf(stderr, "fp_prove: no stream\n"); return 2; }
   { std::ofstream f(yf, std::ios::binary); f.write((const char *)&y, 4); }
@@ -76,7 +85,15 @@ int main(int argc, char **argv) {
   posix_spawn_file_actions_adddup2(&fa, 1, 2);
   const char *cargs[] = {comp.c_str(), cfg.c_str(), ivk.c_str(), reqf.c_str(), yf.c_str(), mark.c_str(), "-id", id.c_str(), nullptr};
   pid_t pid = 0;
-  if (posix_spawn(&pid, comp.c_str(), &fa, nullptr, (char *const *)cargs, environ)) { fprintf(stderr, "fp_prove: no companion\n"); return 2; }
+  // The companion and its children form a process group, which ends with this process, however it ends.
+  posix_spawnattr_t at;
+  posix_spawnattr_init(&at);
+  posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
+  posix_spawnattr_setpgroup(&at, 0);
+  if (posix_spawn(&pid, comp.c_str(), &fa, &at, (char *const *)cargs, environ)) { fprintf(stderr, "fp_prove: no companion\n"); return 2; }
+  companion_group = pid;
+  atexit(stop_companion);
+  for (int s : {SIGABRT, SIGINT, SIGTERM, SIGSEGV, SIGBUS, SIGILL, SIGHUP}) signal(s, on_fatal_signal);
   return cp_with_configured(pol_t, lay, KL, 0, true, [&](const Configured &c) -> int {
     const double t0 = now();
     Companion io;
@@ -95,6 +112,7 @@ int main(int argc, char **argv) {
     EngineMlx engine;
     const NonceSearch search = [&](const ChainPrefix &p, unsigned bits) { return engine.search_nonce(p, bits); };
     IndexMlx table(S, M, *leaf_coins, c.configuration());
+    table.keep_count_in(SpentLedger(seedf + ".spent"));
     printf("leaf table: %.1f s\n", now() - t0);
     const WeightInts wi(W);
     const Units units = Units::of(shape, S.k_col());
@@ -109,7 +127,7 @@ int main(int argc, char **argv) {
     const u64 nb = sr.u();
     const std::vector<u8> file_words(sr.p, sr.p + nb);
     std::unique_ptr<LinBegun> begun_first;
-    if (!lin_begin(table, S, begun_first)) { fprintf(stderr, "fp_prove: the table allows no further batch\n"); return 3; }
+    if (!lin_begin(table, S, begun_first)) { fprintf(stderr, "fp_prove: the table allows no further batch, or its count %s.spent is missing or unreadable\n", seedf.c_str()); return 3; }
     Writer file;
     io.file = &file;
     write_head(file, TAG_PROOF, 0);
