@@ -1,20 +1,10 @@
 # FlashProve on Apple silicon
 
-Proves a request on the bundled synthetic model on a Mac, and checks it with the stock `cp_verify`:
+Proves a request on a bundled synthetic model on a Mac, on the GPU through MLX and Metal, and checks it
+with the stock `cp_verify`. What was measured, and the limits: [MLX_PORT_STATUS.md](MLX_PORT_STATUS.md).
+Use it on synthetic or public weights only.
 
-```
-mlx/demo.sh ~/fpwork/demo
-```
-
-It needs `.venv` with `mlx`, Homebrew's `gcc`, `llvm` and GNU tools. See `MLX_PORT_STATUS.md` for what
-was measured and for the limits: the heavy proof loops run on Metal; witness assembly and some smaller steps are still host code.
-
-# FlashProve on MLX: reproducing the results
-
-The port is unfinished: see [MLX_PORT_STATUS.md](MLX_PORT_STATUS.md). These commands reproduce what
-exists. It cannot yet commit to or prove a model.
-
-## Setup (Apple silicon)
+## Setup
 
 Xcode is not needed: Metal kernels compile at run time.
 
@@ -22,28 +12,46 @@ Xcode is not needed: Metal kernels compile at run time.
 brew install gcc coreutils findutils gnu-sed gawk grep
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python mlx mlx-lm numpy torch
+verifier/build.sh
 ```
 
 `verifier/build.sh` needs GNU tools and g++ first on `PATH`, under the names `g++` and `gcc`.
 
-## Verifier
+## Everything at once
 
 ```sh
-verifier/build.sh
-bin/cp_verify examples/accepted-proof/config examples/accepted-proof/ivk examples/accepted-proof/example.req examples/accepted-proof/example.y examples/accepted-proof/example.proof -id "$(cat examples/accepted-proof/ID.txt)"
+mlx/demo.sh ~/fpwork/demo
 ```
+
+From synthetic weights: reference, commitment, proof, the stock `cp_verify` in a separate process, and
+four rejected changes. It ends with `SUCCESS` and exit 0.
+
+## Step by step
+
+```sh
+K=prover/examples/target_small_f2_roomy; W=~/fpwork/mine
+mlx/fpmlx prepare $K $W                     # the reference, the matrix of cells, a request
+mlx/fpmlx commit  $K $W                     # prints: commitment ID: ...
+mlx/fpmlx prove   $K $W -id ID -out $W/a.proof
+mlx/fpmlx verify  $K $W/ivk $W/request.req $W/a.proof.y $W/a.proof -id ID
+```
+
+`verify` is the stock `bin/cp_verify`. Its exit code and last line are the answer, `YES` here. Pass the ID
+that `commit` printed, or one from a party you trust; never one taken from files that came with a proof.
+Under a clipped-gap kit such as `target_small_f2_gap`, also pass the policy you expect:
+`-policy clipped-gap,C,THETA,CAP,S,SH`, and `prepare` needs `-tokens FILE`, since that kit has no
+`own_choices.req`. A `YES` here says nothing of a provider's model, and it does not show that weights are
+hidden: see `guide/what-is-proved.md` and `guide/weight-hiding.md`.
+
+`DIR/isk` is secret. `seed` re-derives the random entries of the tables. `seed.spent` counts the columns
+that proofs have opened: see the limits in the status file. Do not copy or restore that directory: a
+restored count lets proofs pass the table's limit. This `isk` is not the directory of `cp_commit`, whose
+`isk.txt` and stored tables `prover/` reads. It holds what `fp_prove` needs to rebuild a leaf table.
 
 ## Tests
 
 ```sh
-mlx/build.sh field_test && mlx/build/field_test
-mlx/build.sh engine_test && mlx/build/engine_test
-for t in toy_cpu toy_mlx segments_cpu segments_mlx; do mlx/build.sh $t && mlx/build/$t 8 42; done
-.venv/bin/python mlx/tests/make_reference.py prover/examples/target_small_f2_roomy /tmp/ref
-mlx/build.sh forward_test && mlx/build/forward_test /tmp/ref
-for t in psc_gpu_test form_gpu_test coins_gpu_test kernels_gpu_test; do mlx/build.sh $t && mlx/build/$t; done
-mlx/run_library_tests.sh
+mlx/run_tests.sh ~/fpwork/tests             # all of them, one line each; ends with ALL PASS
 ```
 
-With the same seed, `toy_cpu` and `toy_mlx` print the same proof digest, as do `segments_cpu` and
-`segments_mlx`.
+`mlx/run_tests.sh` builds and runs every test below; its last line says how many failed.

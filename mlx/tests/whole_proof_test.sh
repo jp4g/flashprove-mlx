@@ -9,7 +9,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 W=$1; K=prover/examples/target_small_f2_roomy
 ID=$(sed -n 's/^commitment ID: //p' "$W/commit.log"); T=$W/whole; mkdir -p "$T"
-cp "$W/commit.seed" "$T/seed"; printf '%020d\n' 0 > "$T/seed.spent"
+cp "$W/isk/seed" "$T/seed"; printf '%020d\n' 0 > "$T/seed.spent"
 one() { # name, then environment
   local n=$1; shift
   env "$@" mlx/build/fp_prove_fixed "$K" "$W/ivk" "$W/ref" "$T/seed" "$W/request.req" auto "$ID" "$T/$n.proof" mlx/build/fp_companion > "$T/$n.log" 2>&1 || { echo "FAILED: $n exit $?"; tail -2 "$T/$n.log"; exit 1; }

@@ -17,7 +17,7 @@ out.mkdir(parents=True, exist_ok=True)
 p = Parameters.read(kit / "policy.txt", kit / "KL.bin")
 w = SyntheticWeights(p, "cpu")
 m = IntegerModel(p, w, "cpu")
-req = (kit / "own_choices.req").read_bytes()
+req = (pathlib.Path(sys.argv[3]) if len(sys.argv) > 3 else kit / "own_choices.req").read_bytes()
 T = p.T
 tokens = list(struct.unpack("<%dI" % T, req[:4 * T])) if len(req) >= 4 * T else list(range(T))  # T tokens, then r and e
 tokens = [t % p.V for t in tokens]

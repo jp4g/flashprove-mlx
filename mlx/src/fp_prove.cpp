@@ -61,6 +61,14 @@ int main(int argc, char **argv) {
   HeadRequest q0 = HeadRequest::read(req, shape.T);
   const u32 y = strcmp(argv[6], "auto") ? (u32)atoi(argv[6]) : head_next_token(V, q0, shape.T);
   printf("next token: %u\n", y);
+  // cp_verify's "statement-range", here with a sentence: the companion would end without one.
+  if (q0.r >= q0.e || q0.e > (u32)shape.T) { fprintf(stderr, "fp_prove: the request needs r < e <= T; it has r %u, e %u, T %d\n", q0.r, q0.e, shape.T); return 2; }
+  // Paths that no configuration within reach here has run: refused rather than trusted. See MLX_PORT_STATUS.md.
+  if (!getenv("FP_UNTESTED_PATHS")) {
+    const long long S2 = 1ll << (pol.get("la") - pol.get("lt"));
+    const char *why = shape.V % S2 ? "a vocabulary with padding (v >= V)" : pol.get("NHf") != 1 ? "the head's matrix in several parts" : pol.get("xl", 4) != 5 ? "other than five limbs" : nullptr;
+    if (why) { fprintf(stderr, "fp_prove: this configuration has %s, a path that no proof of this port has run; FP_UNTESTED_PATHS=1 tries it\n", why); return 2; }
+  }
   // The stream, the marker file and the companion.
   const std::string dir = outp + ".work";
   mkdir(dir.c_str(), 0700);
@@ -83,14 +91,19 @@ int main(int argc, char **argv) {
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_addopen(&fa, 1, log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
   posix_spawn_file_actions_adddup2(&fa, 1, 2);
-  const char *cargs[] = {comp.c_str(), cfg.c_str(), ivk.c_str(), reqf.c_str(), yf.c_str(), mark.c_str(), "-id", id.c_str(), nullptr};
+  // The walk runs under the policy of the configuration: under a clipped gap it has to be named.
+  const long long pC = pol.get("C"), pT = pol.get("theta"), pcap = pol.v.at("cap"), psh = pol.get("sh");
+  const std::string named = "clipped-gap," + std::to_string(pC) + "," + std::to_string(pT) + "," + std::to_string(pcap) + "," + std::to_string(pol.get("s")) + "," + std::to_string(psh);
+  std::vector<const char *> cargs{comp.c_str(), cfg.c_str(), ivk.c_str(), reqf.c_str(), yf.c_str(), mark.c_str(), "-id", id.c_str()};
+  if (pC != (1ll << psh) || pT != (1ll << psh) || pcap != 0) cargs.push_back("-policy"), cargs.push_back(named.c_str());
+  cargs.push_back(nullptr);
   pid_t pid = 0;
   // The companion and its children form a process group, which ends with this process, however it ends.
   posix_spawnattr_t at;
   posix_spawnattr_init(&at);
   posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
   posix_spawnattr_setpgroup(&at, 0);
-  if (posix_spawn(&pid, comp.c_str(), &fa, &at, (char *const *)cargs, environ)) { fprintf(stderr, "fp_prove: no companion\n"); return 2; }
+  if (posix_spawn(&pid, comp.c_str(), &fa, &at, (char *const *)cargs.data(), environ)) { fprintf(stderr, "fp_prove: no companion\n"); return 2; }
   companion_group = pid;
   atexit(stop_companion);
   for (int s : {SIGABRT, SIGINT, SIGTERM, SIGSEGV, SIGBUS, SIGILL, SIGHUP}) signal(s, on_fatal_signal);
@@ -227,6 +240,7 @@ int main(int argc, char **argv) {
       q.y = y;
       HeadWitness H = head_build(pol, shape, V, tabs, q, !reference_paths());
       if (!H.norm_ok || !H.margins_ok || !H.bounds_ok) { fprintf(stderr, "fp_prove: the head's witness fails: norm %d margins %d bounds %d\n", H.norm_ok, H.margins_ok, H.bounds_ok); return 3; }
+      { int over = 0; for (int t = 0; t < H.s.T; t++) over += H.co[t] && H.price[t] > H.s.C; printf("positions above C: %d\n", over); }
       HeadProof hp(H, wi.at("Wh"));
       SegMask hm = make_mask(P, sh, lh);
       Arrays arrays = named(hp.arrays0());
