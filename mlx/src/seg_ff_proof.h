@@ -62,6 +62,7 @@ struct FFInput {
   const Units &units;
   const int8_t *matrix;
   u64 columns;
+  u64 matrix_cells;
   std::vector<u32> tokens;
 };
 class FFProver {
@@ -724,7 +725,7 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
     E xp = E::one();
     for (size_t a = 0; a < claims.size(); a++, xp = xp * x) {
       std::vector<E> Ea, Ba;
-      in_.units.claim_maps(claims[a], in_.matrix, in_.columns, Ea, Ba);
+      in_.units.claim_maps(claims[a], in_.matrix, in_.matrix_cells, in_.columns, Ea, Ba);
       const unsigned at = (unsigned)j.maps.size();
       j.maps.push_back(std::move(Ea)), j.maps.push_back(std::move(Ba));
       j.summand.push_back({xp, {at, at + 1}});

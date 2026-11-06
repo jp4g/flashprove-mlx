@@ -26,30 +26,27 @@ public:
   IndexMlx(const LinShape &S, const CellMatrix &M, Coins &coins, const Digest &configuration) : shape_(S.fold.index), configuration_(configuration) {
     const Code &c = shape_.code;
     const u64 rows = shape_.rows(), per = u64(1) << S.k_lo, block = u64(1) << c.log_dim();
-    tail_.resize(rows * c.r);
-    message_.assign(rows * c.ell, 0);
     std::vector<F> tails(rows * c.r);
     coins.fill(tails.data(), tails.size());
-    for (u64 i = 0; i < tails.size(); i++) tail_[i] = tails[i].v;
+    std::vector<u64> tail_words(tails.size());
+    for (u64 i = 0; i < tails.size(); i++) tail_words[i] = tails[i].v;
+    const size_t pn = shape_.pads();
+    std::vector<u64> pad_words(rows * pn);
+    { std::vector<F> pads(pn);
+      for (u64 r = 0; r < rows; r++) {
+        coins.fill(pads.data(), pads.size());
+        for (size_t k = 0; k < pn; k++) pad_words[r * pn + k] = pads[k].v;
+      } }
     // Cell (y, c): entry j + 2^k_lo y of table row r, c = j + 2^k_lo r.
-    in_parallel(rows, [&](u64 r) {
-      for (u64 y = 0; y < M.rows; y++)
-        for (u64 j = 0; j < per; j++) message_[r * c.ell + j + per * y] = from_i64(M.cells[y * M.columns + j + per * r]).v;
-    });
-    std::vector<F> pads(shape_.pads());
-    for (u64 r = 0; r < rows; r++) {
-      coins.fill(pads.data(), pads.size());
-      for (size_t k = 0; k < pads.size(); k++) message_[r * c.ell + shape_.plain() + k] = pads[k].v;
-    }
+    message_ = std::make_unique<mx::array>(index_message(M.cells, M.rows, M.columns, rows, c.ell, per, shape_.plain(), pad_words, pn));
+    TableWords msg, tl;
+    msg.a = Buf(*message_), msg.deg = 1, msg.rows = rows, msg.len = c.ell;
+    tail_ = std::make_unique<mx::array>(mx::array(reinterpret_cast<const uint64_t *>(tail_words.data()), {(int)tail_words.size()}, mx::uint64));
+    tl.a = Buf(*tail_), tl.deg = 1, tl.rows = rows, tl.len = c.r;
     printf("table: message laid out\n");
-    std::vector<u64> coefficients(rows * block, 0);
-    in_parallel(rows, [&](u64 r) {
-      for (size_t i = 0; i < c.ell; i++) coefficients[r * block + c.message_at() + i] = message_[r * c.ell + i];
-      for (size_t i = 0; i < c.r; i++) coefficients[r * block + c.tail_at() + i] = tail_[r * c.r + i];
-    });
     const auto a0 = std::chrono::steady_clock::now();
     each_ = std::min<u64>(rows, 16); // one much larger dispatch runs several times slower per row
-    for (u64 r = 0; r < rows; r += each_) word_.push_back(encode_rows(&coefficients[r * block], each_, c.log_dim(), c.log_n, transform_table(c.log_n)->data()));
+    for (u64 r = 0; r < rows; r += each_) word_.push_back(encode_table(msg, tl, c.message_at(), c.tail_at(), c.ell, c.r, c.log_dim(), c.log_n, transform_table(c.log_n)->data(), r, each_));
     const auto a1 = std::chrono::steady_clock::now();
     tree_ = std::make_unique<OracleTreeMlx>(index_tree(shape_, configuration_), coins);
     const auto a2 = std::chrono::steady_clock::now();
@@ -67,7 +64,7 @@ public:
     IndexRecord rec;
     rec.y.resize(shape_.rows() * shape_.answers);
     in_parallel(shape_.rows(), [&](u64 r) {
-      const F *m = reinterpret_cast<const F *>(&message_[r * shape_.code.ell]);
+      const F *m = reinterpret_cast<const F *>(message_->data<uint64_t>() + r * shape_.code.ell);
       for (unsigned i = 0; i < shape_.answers; i++) rec.y[r * shape_.answers + i] = record_value(shape_, seed[i], i, m);
     });
     return rec;
@@ -90,21 +87,8 @@ public:
     std::vector<E> w(shape_.rows());
     eq_table(gamma, shape_.v, w.data());
     const size_t ell = shape_.code.ell, r = shape_.code.r;
-    message.assign(ell, E::zero());
-    tail.assign(r, E::zero());
-    const u64 chunks = 64;
-    in_parallel(chunks, [&](u64 k) {
-      for (size_t j = ell * k / chunks; j < ell * (k + 1) / chunks; j++) {
-        E s = E::zero();
-        for (u64 x = 0; x < shape_.rows(); x++) s += w[x] * F{message_[x * ell + j]};
-        message[j] = s;
-      }
-      for (size_t j = r * k / chunks; j < r * (k + 1) / chunks; j++) {
-        E s = E::zero();
-        for (u64 x = 0; x < shape_.rows(); x++) s += w[x] * F{tail_[x * r + j]};
-        tail[j] = s;
-      }
-    });
+    message = rows_left(*message_, shape_.rows(), ell, w);
+    tail = rows_left(*tail_, shape_.rows(), r, w);
     if (blocks) block_sums(message, *blocks);
   }
   void open(const PositionList &at, Writer &file, std::vector<F> &columns) override {
@@ -120,7 +104,7 @@ public:
 private:
   IndexShape shape_;
   Digest configuration_, root_{};
-  std::vector<u64> message_, tail_;
+  std::unique_ptr<mx::array> message_, tail_;
   std::vector<Buf> word_;
   u64 each_ = 1;
   std::unique_ptr<OracleTreeMlx> tree_;
@@ -142,7 +126,7 @@ public:
         for (const Tensor &t : x) t.add_to(gv.data());
       }
       gv.resize(S_.matrix_rows);
-      std::vector<E> w = e_download(bytes_left(M_.cells, M_.rows, M_.columns, gv));
+      std::vector<E> w = e_download(matrix_left(M_.cells, M_.rows * M_.columns, 0, M_.rows, M_.columns, gv));
       w_.push_back(std::move(w));
     }
   }

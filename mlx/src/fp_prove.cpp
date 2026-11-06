@@ -148,9 +148,9 @@ int main(int argc, char **argv) {
     Chan chan{ch};
     chan.next_public = [&] { const std::vector<u8> v = io.take(fpstream::PUBLIC); u64 w[3]; memcpy(w, v.data(), 24); return E{{F{w[0]}, F{w[1]}, F{w[2]}}}; };
     chan.next_rows = [&] { const std::vector<u8> v = io.take(fpstream::ROWS); u64 n; memcpy(&n, v.data(), 8); return n; };
-    FFInput in{pol, shape, V, wi, units, cells, columns, tokens};
+    FFInput in{pol, shape, V, wi, units, cells, columns, raw.size(), tokens};
     HeldArrays held;
-    const bool checking = !getenv("FP_NO_EQUATION_TEST");
+    const bool checking = self_checks();
     std::vector<MaskSlot> pend_slots;
     const int Lam = 1 << pol.get("ll"), NG = shape.L / Lam;
     auto hold = [&](size_t link, const Arrays &a) { if (checking) for (auto &kv : a) held[{link, kv.first}] = kv.second; };

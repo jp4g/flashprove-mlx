@@ -65,7 +65,18 @@ blk::E dot_table(const Buf &w, const TableWords &t);
 mx::array e_rows_buffer(size_t entries);
 mx::array put_rows(const mx::array &out, const TableWords &t, size_t first_row);
 // The coefficients of rows from a message and a tail, then the encoding: EngineCpu's encode on every row.
-Buf encode_table(const TableWords &msg, const TableWords &tail, size_t message_at, size_t tail_at, size_t ell, size_t r, unsigned log_dim, unsigned log_n, const blk::F *tw);
+// first, count: the table rows to encode; count 0: all.
+Buf encode_table(const TableWords &msg, const TableWords &tail, size_t message_at, size_t tail_at, size_t ell, size_t r, unsigned log_dim, unsigned log_n, const blk::F *tw, size_t first = 0, size_t count = 0);
+// out[j] += scale entry(i), j being i with its bits spread over the bits outside mask, and value at mask: an
+// engine's term of a Form. In place.
+void add_term(const Buf &out, const TableWords &t, const blk::E &scale, blk::u64 mask, blk::u64 value);
+// A committed table's message: entry j + per y of row r is cell (y, j + per r); then pads; 0 elsewhere.
+mx::array index_message(const int8_t *cells, size_t rows, size_t columns, size_t table_rows, size_t ell, size_t per, size_t plain, const std::vector<blk::u64> &pads, size_t pads_each);
+// out[j] = sum_x w[x] m[x len + j], m in F.
+std::vector<blk::E> rows_left(const mx::array &m, size_t rows, size_t len, const std::vector<blk::E> &w);
+// count[row] += 1 for each key that is not padding, row being the key (no table) or its place in the table:
+// `values` ascending, `rows` beside them, the lowest row first among equals. False: a key is in no row.
+bool lookup_counts(const std::vector<blk::u64> &keys, const std::vector<char> &padding, unsigned k, const std::vector<blk::u64> &values, const std::vector<blk::u32> &rows, blk::u32 *count);
 // entry b + rows i of `dense` to place b ell + i, for b < rows, i < ell.
 Buf rows_first(const Buf &dense, size_t rows, size_t ell);
 // A lookup's product trees. Level m has 2^m vertices; a vertex is the product of two of the level below,
@@ -90,6 +101,8 @@ TableSide lookup_table_side(unsigned kT, unsigned cK, unsigned NC, const std::ve
 Buf column_sums(const int32_t *cells, size_t k, size_t nb, const std::vector<blk::E> &phi);
 // g^T M on a matrix of signed bytes, rows x columns.
 Buf bytes_left(const int8_t *cells, size_t rows, size_t columns, const std::vector<blk::E> &g);
+// The same on rows first .. of a matrix that stays on the GPU between calls, matrix_cells being its size.
+Buf matrix_left(const int8_t *matrix, size_t matrix_cells, size_t first, size_t rows, size_t columns, const std::vector<blk::E> &g);
 // The rounds of a sumcheck, its maps on the GPU. The summand is compiled into a kernel by its shape.
 struct SumShape {
   std::vector<blk::E> coeff;              // by monomial

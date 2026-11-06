@@ -93,7 +93,7 @@ struct Units {
   }
   // The claim as the merge sums it: over the columns c, Ea[c] Ba[c], with Ea the claim's weight of the
   // column and Ba the sum over the unit's rows of the row's weight times the cell.
-  void claim_maps(const WeightClaim &cl, const int8_t *M, u64 columns, std::vector<E> &Ea, std::vector<E> &Ba) const {
+  void claim_maps(const WeightClaim &cl, const int8_t *M, u64 matrix_cells, u64 columns, std::vector<E> &Ea, std::vector<E> &Ba) const {
     const Unit &x = u[cl.ui];
     if (cl.f.size() != x.g.size()) throw std::runtime_error("a claim with another number of factors");
     Ea.assign(columns, E::one());
@@ -135,17 +135,17 @@ struct Units {
     }
     u64 per = 1;
     for (const UnitGroup &q : x.g) per *= q.lam;
-    Ba.assign(columns, E::zero());
+    // The rows' weights in the order of the matrix, then g^T M on the GPU.
+    std::vector<E> g((size_t)per * x.nd);
     E scale = E::one();
-    for (unsigned qd = 0; qd < x.nd; qd++, scale = scale * E::from(from_u64(256))) {
+    for (unsigned qd = 0; qd < x.nd; qd++, scale = scale * E::from(from_u64(256)))
       for (u64 y = 0; y < per; y++) {
         E w = scale;
         u64 rest = y;
         for (size_t i = 0; i < x.g.size(); i++) { w = w * r[i][rest % x.g[i].lam]; rest /= x.g[i].lam; }
-        const int8_t *row = M + (x.off + y + qd * per) * columns;
-        for (u64 c = 0; c < columns; c++) if (row[c]) Ba[c] = Ba[c] + w * from_i64_e(row[c]);
+        g[y + qd * per] = w;
       }
-    }
+    Ba = e_download(matrix_left(M, matrix_cells, x.off, g.size(), columns, g));
   }
   static E from_i64_e(long long v) { return E::from(from_i64(v)); }
 };

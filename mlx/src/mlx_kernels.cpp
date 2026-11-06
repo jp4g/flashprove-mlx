@@ -684,8 +684,8 @@ blk::E dot_table(const Buf &W, const TableWords &t) {
   return sum_partials(p, T, 0, 3);
 }
 mx::array e_rows_buffer(size_t entries) {
-  mx::array a(mx::allocator::malloc(entries * 24), {(int)(3 * entries)}, mx::uint64);
-  memset(a.data<uint64_t>(), 0, entries * 24);
+  mx::array a = run("fp_zero", "out[thread_position_in_grid.x] = 0;", {words(std::vector<blk::u64>(8, 0))}, {"unused_"}, {{(int)(3 * entries)}}, 3 * entries)[0];
+  mx::eval(a);
   return a;
 }
 mx::array put_rows(const mx::array &o, const TableWords &t, size_t first) {
@@ -694,13 +694,13 @@ mx::array put_rows(const mx::array &o, const TableWords &t, size_t first) {
     GlE x = deg == 1 ? GlE{a[at], 0, 0} : GlE{a[at], a[at + 1], a[at + 2]};
     e_st((device ulong *)o, (first + b) * len + i, x);)", {o, t.a.array(), words(std::vector<blk::u64>{t.deg, t.len, first})}, {"o", "a", "q"}, {{1}}, t.len, t.rows)[0];
 }
-Buf encode_table(const TableWords &m, const TableWords &tl, size_t message_at, size_t tail_at, size_t ell, size_t r, unsigned ld, unsigned log_n, const blk::F *tw) {
-  const size_t block = size_t(1) << ld, rows = m.rows * m.deg;
+Buf encode_table(const TableWords &m, const TableWords &tl, size_t message_at, size_t tail_at, size_t ell, size_t r, unsigned ld, unsigned log_n, const blk::F *tw, size_t first, size_t count) {
+  const size_t block = size_t(1) << ld, rows = (count ? count : m.rows) * m.deg;
   const mx::array c = run("fp_coefficients", R"(
-    ulong x = thread_position_in_grid.x, row = thread_position_in_grid.y, deg = q[0], ell = q[1], r = q[2], ma = q[3], ta = q[4], block = q[5], b = row / deg, d = row % deg, v = 0;
+    ulong x = thread_position_in_grid.x, row = thread_position_in_grid.y, deg = q[0], ell = q[1], r = q[2], ma = q[3], ta = q[4], block = q[5], b = q[6] + row / deg, d = row % deg, v = 0;
     if (x >= ma && x < ma + ell) v = a[(b * ell + x - ma) * deg + d];
     else if (x >= ta && x < ta + r) v = tl[(b * r + x - ta) * deg + d];
-    out[row * block + x] = v;)", {m.a.array(), tl.a.array(), words(std::vector<blk::u64>{m.deg, ell, r, message_at, tail_at, block})}, {"a", "tl", "q"}, {{(int)(rows * block)}}, block, rows)[0];
+    out[row * block + x] = v;)", {m.a.array(), tl.a.array(), words(std::vector<blk::u64>{m.deg, ell, r, message_at, tail_at, block, first, 0})}, {"a", "tl", "q"}, {{(int)(rows * block)}}, block, rows)[0];
   return encode_array(c, rows, ld, log_n, tw);
 }
 TableSide lookup_table_side(unsigned kT, unsigned cK, unsigned NC, const std::vector<blk::u64> &rows, const std::vector<blk::u32> &mult, const blk::E &alpha, const blk::E &theta) {
@@ -718,5 +718,78 @@ TableSide lookup_table_side(unsigned kT, unsigned cK, unsigned NC, const std::ve
   const mx::array leaves = run("fp_lookup_table_leaves", "ulong i = thread_position_in_grid.x, n = p[0]; e_st(out, i, e_add(GlE{1, 0, 0}, e_mul(e_ld(a, i), e_ld(a, n + i))));",
                                {bits_rows, words(std::vector<blk::u64>{n})}, {"a", "p"}, {{(int)(3 * n)}}, n)[0];
   return {bits_rows, leaves};
+}
+void add_term(const Buf &o, const TableWords &t, const blk::E &scale, blk::u64 mask, blk::u64 value) {
+  const size_t n = t.len << t.log_rows;
+  const mx::array done = run("fp_add_term", R"(
+    ulong i = thread_position_in_grid.x, deg = q[0], lr = q[1], rows = q[2], len = q[3], mask = q[4], value = q[5];
+    ulong row = i & ((1ul << lr) - 1), place = i >> lr;
+    if (row >= rows) return;
+    ulong at = (row * len + place) * deg, j = value, rest = i;
+    for (uint b = 0; rest != 0; b++) if (!((mask >> b) & 1)) { j |= (rest & 1) << b; rest >>= 1; }
+    GlE x = deg == 1 ? GlE{a[at], 0, 0} : GlE{a[at], a[at + 1], a[at + 2]};
+    device ulong *O = (device ulong *)o;
+    e_st(O, j, e_add(e_ld(O, j), e_mul(GlE{q[6], q[7], q[8]}, x)));)",
+    {o.array(), t.a.array(), words(std::vector<blk::u64>{t.deg, t.log_rows, t.rows, t.len, mask, value, scale.c[0].v, scale.c[1].v, scale.c[2].v})}, {"o", "a", "q"}, {{1}}, n)[0];
+  mx::eval(done);
+}
+mx::array index_message(const int8_t *cells, size_t rows, size_t columns, size_t table_rows, size_t ell, size_t per, size_t plain, const std::vector<blk::u64> &pads, size_t pads_each) {
+  const mx::array c(cells, {(int)(rows * columns)}, mx::int8);
+  std::vector<blk::u64> pd = pads;
+  pd.resize(std::max<size_t>(pd.size(), 8), 0);
+  return run("fp_index_message", R"(
+    ulong j = thread_position_in_grid.x, r = thread_position_in_grid.y, rows = q[0], columns = q[1], ell = q[2], per = q[3], plain = q[4], each = q[5], y = j / per, v = 0;
+    if (y < rows) { long x = ce[y * columns + j % per + per * r]; v = x < 0 ? GL_P - (ulong)(-x) : (ulong)x; }
+    else if (j >= plain && j < plain + each) v = pd[r * each + j - plain];
+    out[r * ell + j] = v;)", {c, words(pd), words(std::vector<blk::u64>{rows, columns, ell, per, plain, pads_each, 0, 0})}, {"ce", "pd", "q"}, {{(int)(table_rows * ell)}}, ell, table_rows)[0];
+}
+std::vector<blk::E> rows_left(const mx::array &m, size_t rows, size_t len, const std::vector<blk::E> &w) {
+  const mx::array o = run("fp_rows_left", R"(
+    ulong j = thread_position_in_grid.x, rows = q[0], len = q[1]; GlE s = {0, 0, 0};
+    for (ulong x = 0; x < rows; x++) s = e_add(s, e_scale(e_ld(w, x), m[x * len + j]));
+    e_st(out, j, s);)", {m, e_array(w), words(std::vector<blk::u64>{rows, len, 0, 0, 0, 0, 0, 0})}, {"m", "w", "q"}, {{(int)(3 * len)}}, len)[0];
+  return e_fetch(o);
+}
+bool lookup_counts(const std::vector<blk::u64> &keys, const std::vector<char> &padding, unsigned k, const std::vector<blk::u64> &values, const std::vector<blk::u32> &rows, blk::u32 *count) {
+  std::vector<blk::u64> v = values;
+  std::vector<uint32_t> r(rows.begin(), rows.end());
+  const size_t tn = v.size();
+  v.resize(std::max<size_t>(v.size(), 8), 0), r.resize(std::max<size_t>(r.size(), 16), 0);
+  const size_t cn = size_t(1) << k;
+  mx::array cnt(mx::allocator::malloc(4 * std::max<size_t>(cn, 16)), {(int)std::max<size_t>(cn, 16)}, mx::uint32);
+  memset(cnt.data<uint32_t>(), 0, 4 * std::max<size_t>(cn, 16));
+  const mx::array pad(reinterpret_cast<const uint8_t *>(padding.data()), {(int)padding.size()}, mx::uint8);
+  mx::array flag(mx::allocator::malloc(64), {16}, mx::uint32);
+  memset(flag.data<uint32_t>(), 0, 64);
+  const mx::array done = run("fp_lookup_counts", R"(
+    ulong i = thread_position_in_grid.x, tn = q[0], k = q[1], key = ks[i];
+    if (pd[i]) return;
+    uint row;
+    if (tn == 0) { if (key >> k) { atomic_store_explicit((device atomic_uint *)fl, 1u, memory_order_relaxed); return; } row = (uint)key; }
+    else {
+      ulong lo = 0, hi = tn;
+      while (lo < hi) { ulong mid = (lo + hi) / 2; if (tv[mid] < key) lo = mid + 1; else hi = mid; }
+      if (lo == tn || tv[lo] != key) { atomic_store_explicit((device atomic_uint *)fl, 1u, memory_order_relaxed); return; }
+      row = tr[lo];
+    }
+    atomic_fetch_add_explicit((device atomic_uint *)cnt + row, 1u, memory_order_relaxed);)",
+    {words(keys), pad, words(v), mx::array(r.data(), {(int)r.size()}, mx::uint32), cnt, flag, words(std::vector<blk::u64>{tn, k, 0, 0, 0, 0, 0, 0})}, {"ks", "pd", "tv", "tr", "cnt", "fl", "q"}, {{1}}, keys.size())[0];
+  mx::eval(done);
+  memcpy(count, cnt.data<uint32_t>(), 4 * cn);
+  return flag.data<uint32_t>()[0] == 0;
+}
+static const mx::array &matrix_on_gpu(const int8_t *matrix, size_t n) {
+  static const int8_t *at = nullptr;
+  static size_t size = 0;
+  static std::unique_ptr<mx::array> kept;
+  if (at != matrix || size != n) kept = std::make_unique<mx::array>(matrix, mx::Shape{(int)n}, mx::int8), at = matrix, size = n;
+  return *kept;
+}
+Buf matrix_left(const int8_t *matrix, size_t cells, size_t first, size_t rows, size_t columns, const std::vector<blk::E> &g) {
+  return Buf(run("fp_matrix_left",
+                 "ulong x = thread_position_in_grid.x, columns = p[0], rows = p[1], first = p[2]; GlE s = {0, 0, 0};"
+                 "for (ulong y = 0; y < rows; y++) { long v = ce[(first + y) * columns + x]; if (v) s = e_add(s, e_scale(e_ld(g, y), v < 0 ? GL_P - (ulong)(-v) : (ulong)v)); }"
+                 "e_st(out, x, s);",
+                 {matrix_on_gpu(matrix, cells), e_array(g), words(std::vector<blk::u64>{columns, rows, first})}, {"ce", "g", "p"}, {{(int)(3 * columns)}}, columns)[0]);
 }
 }

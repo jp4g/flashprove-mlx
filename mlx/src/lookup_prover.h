@@ -52,22 +52,17 @@ inline bool lookup_multiplicities(const std::vector<LookupCall> &calls, const Lo
   m.assign(s.NC, std::vector<u32>(size_t(1) << s.kT, 0));
   for (unsigned c = 0; c < s.NC; c++) {
     const LookupCall &L = calls[c];
-    if (L.table.empty()) { // the range table: a key is its row
-      for (u64 x = 0; x < (u64(1) << L.n); x++) {
-        if (L.padding[x]) continue;
-        if (L.keys[x] >> L.k) return false;
-        m[c][L.keys[x]]++;
-      }
-      continue;
+    std::vector<u64> values;
+    std::vector<u32> rows;
+    if (!L.table.empty()) {
+      const u64 n = u64(1) << L.k;
+      rows.resize(n);
+      for (u32 t = 0; t < n; t++) rows[t] = t;
+      std::stable_sort(rows.begin(), rows.end(), [&](u32 a, u32 b) { return L.table[a] < L.table[b]; });
+      values.resize(n);
+      for (u64 i = 0; i < n; i++) values[i] = L.table[rows[i]];
     }
-    std::unordered_map<u64, u32> row;
-    for (u64 t = 0; t < (u64(1) << L.k); t++) row.emplace(L.row(t), (u32)t);
-    for (u64 x = 0; x < (u64(1) << L.n); x++) {
-      if (L.padding[x]) continue;
-      auto it = row.find(L.keys[x]);
-      if (it == row.end()) return false;
-      m[c][it->second]++;
-    }
+    if (!lookup_counts(L.keys, L.padding, L.k, values, rows, m[c].data())) return false;
   }
   return true;
 }

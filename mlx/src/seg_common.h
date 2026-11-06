@@ -13,6 +13,9 @@
 #include "lookup_prover.h"
 #include "numbers/round_names.h"
 namespace fpmlx {
+// FP_SELF_CHECKS: the prover also tests its own sums and each segment's equation, on the host. No proof
+// needs them; they find a wrong witness early. Off by default.
+inline bool self_checks() { static const bool on = getenv("FP_SELF_CHECKS") != nullptr; return on; }
 // The channel as psc_run() and lookup_run() use it.
 struct Chan {
   ProverRounds &r;

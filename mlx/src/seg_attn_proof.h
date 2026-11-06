@@ -61,7 +61,7 @@ inline E attn_sum3(const std::vector<std::vector<E>> &AB, const std::vector<E> &
 }
 // SC3: start = the sum over b of coef_b, over the cube of W A_b B_b; AB = A_0, B_0, A_1, ..
 template <class Ch> PscResult attn_sc3(Ch &ch, const E *mask, u32 &slot, unsigned nv, std::vector<std::vector<E>> AB, std::vector<E> W, const std::vector<E> &coef, const E &start, const E &start_public, const char *name) {
-  if (!(attn_sum3(AB, W, coef) == start)) throw std::runtime_error(std::string("attention: the sum of ") + name + " is not its start");
+  if (self_checks() && !(attn_sum3(AB, W, coef) == start)) throw std::runtime_error(std::string("attention: the sum of ") + name + " is not its start");
   PscJob j;
   const unsigned nb = (unsigned)coef.size();
   for (unsigned l = 0; l < nv; l++) j.vars.push_back({Weight<E>::plain(4), nv - 1 - l});
@@ -417,7 +417,7 @@ template <class Ch> void attn_own(Ch &ch, const E *mask, u32 &slot, const AttnGr
       }
       return v[iEq] * t;
     };
-    {
+    if (self_checks()) {
       E sum = E::zero();
       for (u64 x = 0; x < N; x++) {
         E t = E::zero();

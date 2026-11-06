@@ -391,18 +391,15 @@ private:
       return fpmlx::e_upload(w);
     }
     fpmlx::Buf out = fpmlx::tensors_written(c.tensors, vars);
+    for (const EngineTerm &term : c.engine_terms) {
+      const Table &t = table(term.vector);
+      BLK_REQUIRE(t.entries() << __builtin_popcountll(term.choice_mask) == length, "engine: a term's vector has not the length that the form gives it");
+      fpmlx::add_term(out, fpmlx::table_words(t), term.scale, term.choice_mask, term.choice_value);
+    }
     E *o = const_cast<E *>(reinterpret_cast<const E *>(out.data()));
     for (const std::pair<u64, E> &e : c.entries) {
       BLK_REQUIRE(e.first >> vars == 0, "form: an entry beyond the vector's length");
       o[e.first] += e.second;
-    }
-    for (const EngineTerm &term : c.engine_terms) {
-      const Table &t = table(term.vector);
-      std::vector<E> w(t.entries());
-      for (u64 j = 0; j < t.entries(); j++) w[j] = t.entry(j);
-      BLK_REQUIRE(w.size() << __builtin_popcountll(term.choice_mask) == length, "engine: a term's vector has not the length that the form gives it");
-      for (u64 j = 0; j < length; j++)
-        if ((j & term.choice_mask) == term.choice_value) o[j] += engine_term_at(term, w, j, vars);
     }
     return out;
   }
