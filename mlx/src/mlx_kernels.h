@@ -120,6 +120,19 @@ mx::array lay_block(const mx::array &table, unsigned table_deg, size_t len, cons
 // A matrix's combinations into the smallness test's digits: low and high keys at (u << lc) + off + i, ZZ
 // at u 2 mz + off + i and u 2 mz + mz + off + i. flag[0] is set if one has left its window. In place.
 mx::array digit_split(const mx::array &v, size_t m, size_t tau, size_t off, size_t mz, unsigned lc, const mx::array &low, const mx::array &high, const mx::array &pad, const mx::array &zz, const mx::array &flag);
+// Sums with weights over a forward pass's int64 values, T rows of n: by column, sum_t w[t] v[t n + x]; by
+// row, sum_x w[x] v[t n + x].
+std::vector<blk::E> token_dots(const mx::array &v, size_t T, size_t n, const std::vector<blk::E> &w);
+std::vector<blk::E> row_dots(const mx::array &v, size_t T, size_t n, const std::vector<blk::E> &w);
+// The rope's pairs of step 8: at (pa, t), out[2 (pa T + t)] and + 1: sum over the heads of co (w0 p0 + w1 p1) and
+// co (w1 p0 - w0 p1), p from the sums before the rope, w0 = ew[hd dh + 2 pa], w1 the next.
+std::vector<blk::E> rope_pairs(const mx::array &preq, const mx::array &prek, size_t H, size_t G, size_t dh, size_t T, const std::vector<blk::E> &ew, const blk::E &co);
+// Step 6's table: entry (i P + j) T + t is sum_l gp[l] limb_l(stream i, t, j); 0 at j >= d. n entries.
+mx::array stream_table(const mx::array &streams, size_t NI, size_t T, size_t d, size_t P, unsigned limbs, const std::vector<blk::E> &gp, size_t n);
+// Into a table of E, in place: entry (index P + x) T + t = -v[t cols + first + x], for x < count.
+mx::array minus_rows(const mx::array &table, const mx::array &v, size_t cols, size_t first, size_t count, size_t index, size_t P, size_t T);
+// sum_i w[i] a[i] b[i].
+blk::E dot3(const std::vector<blk::E> &w, const mx::array &a, const mx::array &b);
 // Smallness::u3(): entry c nb + b is the sum over r < len of phi[r] cells[(b len + r) k + c].
 Buf column_sums(const int32_t *cells, size_t k, size_t nb, const std::vector<blk::E> &phi);
 // g^T M on a matrix of signed bytes, rows x columns.

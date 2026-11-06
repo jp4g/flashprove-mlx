@@ -41,6 +41,26 @@ template <class Ch> LevelOut product_level(Ch &ch, const E *mask, u32 &slot, std
   o.values = r.values;
   return o;
 }
+// The same on two tables on the GPU.
+template <class Ch> LevelOut product_level(Ch &ch, const E *mask, u32 &slot, const mx::array &L, const mx::array &R, const std::vector<E> &point, const std::vector<unsigned> &order) {
+  const unsigned m = (unsigned)point.size();
+  PscJob j;
+  if (reference_paths()) {
+    const std::vector<E> w = eq_all(point), a = e_fetch(L), b = e_fetch(R);
+    for (size_t i = 0; i < w.size(); i++) j.start_value = j.start_value + w[i] * a[i] * b[i];
+  } else j.start_value = dot3(eq_all(point), L, R);
+  for (unsigned l = 0; l < m; l++) j.vars.push_back({Weight<E>::equality(point[m - 1 - order[l]], 3), order[l]});
+  j.device = std::make_shared<mx::array>(mx::concatenate({L, R}, 0)), j.device_maps = 2;
+  j.summand = {{E::one(), {0, 1}}};
+  j.shown = 2, j.degree_y = 2;
+  const PscResult r = psc_run(ch, mask, slot, std::move(j));
+  (void)ch.line();
+  LevelOut o;
+  o.r.resize(m);
+  for (unsigned l = 0; l < m; l++) o.r[m - 1 - order[l]] = r.challenges[l];
+  o.values = r.values;
+  return o;
+}
 // The panels of step 11.
 struct Panel {
   bool tri = false, weights = false, virt = false, second = false;
@@ -141,6 +161,13 @@ private:
     if (sg == 2 * s_.Lam) return (g_ + 1) * s_.Lam == s_.L ? in_.V.get("x_last", t, j) : in_.V.get("x." + std::to_string((g_ + 1) * s_.Lam), t, j);
     return in_.V.get(L(sg % 2 ? "x_mid" : "x", lam), t, j);
   }
+  // The stream sg, and a value's array, as the forward pass left them on the GPU.
+  mx::array stream(int sg) const {
+    if (sg == 2 * s_.Lam) return in_.V.g.at((g_ + 1) * s_.Lam == s_.L ? std::string("x_last") : "x." + std::to_string((g_ + 1) * s_.Lam));
+    return in_.V.g.at(L(sg % 2 ? "x_mid" : "x", sg / 2));
+  }
+  mx::array value(const char *n, int lam) const { return in_.V.g.at(L(n, lam)); }
+  mx::array hh_array(int lam) const { return mx::multiply(value("s", lam), value("u", lam)); }
   bool moe(int lam) const { return s_.NE && (lam & 1); }
   int call_of(const std::string &seg) const {
     for (size_t c = 0; c < G_.place.size(); c++) if (G_.place[c].count(seg)) return (int)c;
@@ -187,25 +214,14 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
   {
     std::vector<E> gp(XL, E::one());
     for (int l = 1; l < XL; l++) gp[l] = gp[l - 1] * gam;
-    std::vector<E> Y(1ull << (lNI + lPd + lt), E::zero());
-    psc_parallel((size_t)NI * d, [&](size_t a, size_t e) {
-      int32_t c[8];
-      for (size_t q = a; q < e; q++) {
-        const int i = (int)(q / d), j = (int)(q % d);
-        for (int t = 0; t < T; t++) {
-          limbs_of(str(i, t, j), XL, c);
-          E y = E::zero();
-          for (int l = 0; l < XL; l++) y = y + gp[l] * fe_of(c[l]);
-          Y[((u64)i * Pd + j) * T + t] = y;
-        }
-      }
-    });
+    std::vector<mx::array> st;
+    for (int i = 0; i < NI; i++) st.push_back(mx::reshape(stream(i), {-1}));
+    const mx::array Y = stream_table(mx::concatenate(st, 0), NI, T, d, Pd, XL, gp, 1ull << (lNI + lPd + lt));
     std::vector<E> rho = rhoI;
     const E half = inv(E::from(from_u64(2)));
     rho.insert(rho.end(), lPd, half);
     rho.insert(rho.end(), PV.begin(), PV.end());
-    std::vector<E> Y2 = Y;
-    rV_ = product_level(ch, mask, slot, std::move(Y), std::move(Y2), rho, order_default((unsigned)rho.size())).r;
+    rV_ = product_level(ch, mask, slot, Y, Y, rho, order_default((unsigned)rho.size())).r;
   }
   // Step 7.
   auto prod = [&](const NormRow &r, int k) -> I64 {
@@ -295,7 +311,6 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
       }
     }
   }
-  auto hh = [&](int lam, int x, int t) { return V.get(L("s", lam), t, x) * V.get(L("u", lam), t, x); };
   const unsigned nR = 2 * Lam, nEnd = nR + LamM * (1 + NE);
   std::vector<std::vector<E>> shownM(nEnd, std::vector<E>(T, E::zero())), Z(nEnd, std::vector<E>(T, E::zero()));
   for (unsigned i = 0; i < nR; i++) for (int t = 0; t < T; t++) shownM[i][t] = fe_of(G_.rows[i][t].R);
@@ -316,9 +331,6 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
     if (!layer(lam).rp) return sine ? 0 : 1 << 12;
     return W.at(sine ? "table.sin" : "table.cos")[(size_t)t * (s.dh / 2) + pa];
   };
-  auto pr_of = [&](int lam, int hd, int ch2, int t) -> I64 {
-    return hd < s.H ? V.get(L("sum_preq", lam), t, hd * s.dh + ch2) : V.get(L("sum_prek", lam), t, (hd - s.H) * s.dh + ch2);
-  };
   for (size_t c = 0; c < in_.pol.call.size(); c++) {
     const std::vector<E> el = el_of((int)c);
     const E ec = lk.e[c];
@@ -328,26 +340,19 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
         const std::vector<E> ew = ew_of(sn);
         for (int lam = 0; lam < Lam; lam++) {
           const int i = 2 * lam + n;
-          for (int t = 0; t < T; t++) {
-            E a = E::zero();
-            for (int x = 0; x < d; x++) a = a + ew[x] * fe_of(str(i, t, x));
-            Z[i][t] = Z[i][t] + ec * el[lam] * a;
-          }
+          const std::vector<E> a = row_dots(stream(i), T, d, ew);
+          for (int t = 0; t < T; t++) Z[i][t] = Z[i][t] + ec * el[lam] * a[t];
         }
       } else if (sn == "QK") {
         const std::vector<E> ew = ew_of(sn);
         for (int lam = 0; lam < Lam; lam++) {
           const E co = ec * el[lam] * lift2(layer(lam).kq);
+          const std::vector<E> rp = rope_pairs(value("sum_preq", lam), value("sum_prek", lam), s.H, s.G, s.dh, T, ew, co);
           for (int pa = 0; pa < s.dh / 2; pa++) {
             Pair pc{std::vector<E>(T), std::vector<E>(T, E::zero())}, ps{std::vector<E>(T), std::vector<E>(T, E::zero())};
             for (int t = 0; t < T; t++) {
               pc.a[t] = fe_of(rope(lam, t, pa, false)), ps.a[t] = fe_of(rope(lam, t, pa, true));
-              for (int hd = 0; hd < s.H + s.G; hd++) {
-                const E w0 = ew[hd * s.dh + 2 * pa], w1 = ew[hd * s.dh + 2 * pa + 1];
-                const E p0 = fe_of(pr_of(lam, hd, 2 * pa, t)), p1 = fe_of(pr_of(lam, hd, 2 * pa + 1, t));
-                pc.b[t] = pc.b[t] + co * (w0 * p0 + w1 * p1);
-                ps.b[t] = ps.b[t] + co * (w1 * p0 - w0 * p1);
-              }
+              pc.b[t] = rp[2 * ((size_t)pa * T + t)], ps.b[t] = rp[2 * ((size_t)pa * T + t) + 1];
             }
             pairs.push_back(std::move(pc)), pairs.push_back(std::move(ps));
           }
@@ -358,11 +363,8 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
         const std::vector<E> ew = ew_of(sn);
         for (int lm = 0; lm < LamM; lm++) {
           const int lam = 2 * lm + 1;
-          for (int t = 0; t < T; t++) {
-            E a = E::zero();
-            for (int x = 0; x < d; x++) a = a + ew[x] * fe_of(V.get(L("m", lam), t, x));
-            Z[sc_at(lm)][t] = Z[sc_at(lm)][t] + ec * el[lam] * a;
-          }
+          const std::vector<E> a = row_dots(value("m", lam), T, d, ew);
+          for (int t = 0; t < T; t++) Z[sc_at(lm)][t] = Z[sc_at(lm)][t] + ec * el[lam] * a[t];
         }
       } else if (sn == "DD" || sn == "MR") {
         const std::vector<E> ew = ew_of(sn);
@@ -371,31 +373,29 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
         else wS = ew[0];
         for (int lm = 0; lm < LamM; lm++) {
           const int lam = 2 * lm + 1;
+          const std::vector<I64> &lr = V.at(L("lr", lam));
           for (int e = 0; e < NE; e++)
-            for (int t = 0; t < T; t++) Z[sel_at(lm, e)][t] = Z[sel_at(lm, e)][t] + ec * el[lam] * wS * fe_of(V.get(L("lr", lam), t, e));
+            for (int t = 0; t < T; t++) Z[sel_at(lm, e)][t] = Z[sel_at(lm, e)][t] + ec * el[lam] * wS * fe_of(lr[(size_t)t * NE + e]);
         }
       } else if (sn == "G" || sn == "U") {
         for (int lm = 0; lm < LamM; lm++) {
           const int lam = 2 * lm + 1;
           const E co = ec * el[lam] * lift2(sn == "U" ? layer(lam).kuR : layer(lam).kgR);
           const auto &FB = sn == "U" ? FBu[lm] : FBg[lm];
-          for (int e = 0; e < NE; e++)
-            for (int t = 0; t < T; t++) {
-              E a = E::zero();
-              for (int y = 0; y < d; y++) a = a + FB[e][y] * fe_of(V.get(L("xr", lam), t, y));
-              Z[sel_at(lm, e)][t] = Z[sel_at(lm, e)][t] + co * a;
-            }
+          for (int e = 0; e < NE; e++) {
+            const std::vector<E> a = row_dots(value("xr", lam), T, d, FB[e]);
+            for (int t = 0; t < T; t++) Z[sel_at(lm, e)][t] = Z[sel_at(lm, e)][t] + co * a[t];
+          }
         }
       } else if (sn == "D") {
         for (int lm = 0; lm < LamM; lm++) {
           const int lam = 2 * lm + 1;
           const E co = ec * el[lam] * lift2(layer(lam).kd);
-          for (int e = 0; e < NE; e++)
-            for (int t = 0; t < T; t++) {
-              E a = E::zero();
-              for (int y = 0; y < fe; y++) a = a + FBd[lm][e][y] * fe_of(hh(lam, fe + y, t));
-              Z[sel_at(lm, e)][t] = Z[sel_at(lm, e)][t] + co * a;
-            }
+          const mx::array routed = mx::slice(hh_array(lam), {0, fe}, {T, f}); // the routed expert's half
+          for (int e = 0; e < NE; e++) {
+            const std::vector<E> a = row_dots(mx::contiguous(routed), T, fe, FBd[lm][e]);
+            for (int t = 0; t < T; t++) Z[sel_at(lm, e)][t] = Z[sel_at(lm, e)][t] + co * a[t];
+          }
         }
       }
     }
@@ -433,10 +433,9 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
   // Step 11: the panels, in the order of the list.
   std::vector<Panel> bl;
   u32 nextV = 0;
-  auto dotz = [&](const std::vector<E> &w, const std::string &name, int x) { return dot_t(w, [&](int t) { return V.get(name, t, x); }); };
   auto rsv = [&](const std::vector<E> &w, const char *n, int lam, u64 ny) {
-    std::vector<E> v(ny);
-    psc_parallel(ny, [&](size_t a, size_t e) { for (size_t y = a; y < e; y++) v[y] = dotz(w, L(n, lam), (int)y); });
+    std::vector<E> v = token_dots(value(n, lam), T, in_.V.cols.at(L(n, lam)), w);
+    v.resize(ny);
     return v;
   };
   auto weights_panel = [&](bool moe_set, u64 ny, const E &ec, const std::function<std::vector<E>(int)> &FA, const std::function<std::vector<E>(int)> &FB, const std::function<E(int)> &wt) {
@@ -475,9 +474,7 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
       } else if (sn == "D") {
         const std::vector<E> ew = ew_of(sn);
         weights_panel(false, f, ec, [&](int lam) {
-                        std::vector<E> v(f);
-                        psc_parallel(f, [&](size_t a, size_t e) { for (size_t y = a; y < e; y++) v[y] = dot_t(ezt, [&](int t) { return hh(lam, (int)y, t); }); });
-                        return v;
+                        return token_dots(hh_array(lam), T, f, ezt);
                       },
                       [&](int lam) {
                         const u64 cols = moe(lam) ? fe : f;
@@ -517,8 +514,9 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
         const std::vector<E> ew = ew_of(sn);
         pair_panel(false, 1, [&](int lam, u64) { return sh[2 * lam + n]; },
                    [&](int lam, u64) {
+                     const std::vector<E> v = token_dots(stream(2 * lam + n), T, d, ert);
                      E a = E::zero();
-                     for (int x = 0; x < d; x++) a = a + ew[x] * dot_t(ert, [&](int t) { return str(2 * lam + n, t, x); });
+                     for (int x = 0; x < d; x++) a = a + ew[x] * v[x];
                      return a;
                    },
                    [&](int lam) { return el[lam]; });
@@ -547,8 +545,9 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
         const std::vector<E> ew = ew_of(sn);
         pair_panel(true, 1, [&](int lam, u64) { return sh[sc_at(lam / 2)]; },
                    [&](int lam, u64) {
+                     const std::vector<E> v = token_dots(value("m", lam), T, d, ert);
                      E a = E::zero();
-                     for (int x = 0; x < d; x++) a = a + ew[x] * dotz(ert, L("m", lam), x);
+                     for (int x = 0; x < d; x++) a = a + ew[x] * v[x];
                      return a;
                    },
                    [&](int lam) { return el[lam]; });
@@ -557,7 +556,7 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
         E wS = E::zero();
         if (sn == "DD") for (const E &x : ew) wS = wS + x;
         else wS = ew[0];
-        pair_panel(true, NE, [&](int lam, u64 e) { return sh[sel_at(lam / 2, (int)e)]; }, [&](int lam, u64 e) { return dotz(ert, L("lr", lam), (int)e); },
+        pair_panel(true, NE, [&](int lam, u64 e) { return sh[sel_at(lam / 2, (int)e)]; }, [&](int lam, u64 e) { return token_dots(value("lr", lam), T, NE, ert)[e]; },
                    [&](int lam) { return el[lam] * wS; });
       } else if (sn == "G" || sn == "U" || sn == "D") {
         for (int lm = 0; lm < LamM; lm++) {
@@ -570,8 +569,7 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
           for (int e = 0; e < NE; e++) b.FB.insert(b.FB.end(), FB[e].begin(), FB[e].end());
           if (sn == "D") {
             b.virt = true, b.virt_no = 1 + lm;
-            b.xx.resize(fe);
-            psc_parallel(fe, [&](size_t a, size_t e) { for (size_t y = a; y < e; y++) b.xx[y] = dot_t(ert, [&](int t) { return hh(lam, fe + (int)y, t); }); });
+            { const std::vector<E> v = token_dots(hh_array(lam), T, f, ert); b.xx.assign(v.begin() + fe, v.begin() + f); }
             b.wt.push_back(el[lam] * lift2(layer(lam).kd));
           } else {
             b.xx = rsv(ert, "xr", lam, d);
@@ -661,41 +659,32 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
   };
   (void)psc_run(ch, mask, slot, std::move(j11));
   // Step 12.
-  auto minus_table = [&](u64 size, const std::function<void(std::vector<E> &, std::vector<E> &)> &fill) {
-    std::pair<std::vector<E>, std::vector<E>> p{std::vector<E>(size, E::zero()), std::vector<E>(size, E::zero())};
-    fill(p.first, p.second);
-    return p;
-  };
   {
-    auto p = minus_table(1ull << (ll + lPf + lt), [&](std::vector<E> &a, std::vector<E> &b) {
-      for (int lam = 0; lam < Lam; lam++)
-        for (int x = 0; x < f; x++)
-          for (int t = 0; t < T; t++) {
-            const u64 i = ((u64)lam * Pf + x) * T + t;
-            a[i] = fe_of(-V.get(L("s", lam), t, x)), b[i] = fe_of(-V.get(L("u", lam), t, x));
-          }
-    });
+    const u64 n = 1ull << (ll + lPf + lt);
+    mx::array a = e_rows_buffer(n), b = e_rows_buffer(n);
+    std::vector<mx::array> done;
+    for (int lam = 0; lam < Lam; lam++) done.push_back(minus_rows(a, value("s", lam), f, 0, f, lam, Pf, T)), done.push_back(minus_rows(b, value("u", lam), f, 0, f, lam, Pf, T));
+    mx::eval(done);
     std::vector<E> rho;
     for (unsigned v = ll + lPf; v-- > 0;) rho.push_back(rs[v]);
     rho.insert(rho.end(), zt.begin(), zt.end());
-    (void)product_level(ch, mask, slot, std::move(p.first), std::move(p.second), rho, order_range((unsigned)rho.size()));
+    (void)product_level(ch, mask, slot, a, b, rho, order_range((unsigned)rho.size()));
   }
   // Steps 13, 14.
   if (NE) {
     std::vector<E> rho;
     if (ll > 1) rho = ch.point(R_JOIN, ll - 1);
-    auto p = minus_table(1ull << (ll - 1 + lfe + lt), [&](std::vector<E> &a, std::vector<E> &b) {
-      for (int lm = 0; lm < LamM; lm++)
-        for (int x = 0; x < fe; x++)
-          for (int t = 0; t < T; t++) {
-            const u64 i = ((u64)lm * fe + x) * T + t;
-            const int lam = 2 * lm + 1;
-            a[i] = fe_of(-V.get(L("s", lam), t, fe + x)), b[i] = fe_of(-V.get(L("u", lam), t, fe + x));
-          }
-    });
+    const u64 n = 1ull << (ll - 1 + lfe + lt);
+    mx::array a = e_rows_buffer(n), b = e_rows_buffer(n);
+    std::vector<mx::array> done;
+    for (int lm = 0; lm < LamM; lm++) {
+      const int lam = 2 * lm + 1;
+      done.push_back(minus_rows(a, value("s", lam), f, fe, fe, lm, fe, T)), done.push_back(minus_rows(b, value("u", lam), f, fe, fe, lm, fe, T));
+    }
+    mx::eval(done);
     for (unsigned v = lfe; v-- > 0;) rho.push_back(rs[v]);
     rho.insert(rho.end(), rt.begin(), rt.end());
-    (void)product_level(ch, mask, slot, std::move(p.first), std::move(p.second), rho, order_range((unsigned)rho.size()));
+    (void)product_level(ch, mask, slot, a, b, rho, order_range((unsigned)rho.size()));
   }
   // Step 15.
   if (hasE) {

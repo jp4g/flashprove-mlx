@@ -973,4 +973,106 @@ mx::array digit_split(const mx::array &v, size_t m, size_t tau, size_t off, size
     ((device ulong *)z)[u * cols + off + i] = lo, ((device ulong *)z)[u * cols + mz + off + i] = hi;)",
     {v, low, high, pad, zz, flag, words(std::vector<blk::u64>{m, off, mz, lc, 0, 0, 0, 0})}, {"w", "kl", "kh", "pd", "z", "fl", "q"}, {{1}}, m, tau)[0];
 }
+static const int64_t *i64_data(const mx::array &v) { mx::eval(v); return v.data<int64_t>(); }
+static blk::E fe_i64(long long v) { return blk::E::from(blk::from_i64(v)); }
+std::vector<blk::E> token_dots(const mx::array &v, size_t T, size_t n, const std::vector<blk::E> &w) {
+  if (reference_paths()) {
+    const int64_t *d = i64_data(v);
+    std::vector<blk::E> o(n, blk::E::zero());
+    for (size_t x = 0; x < n; x++) for (size_t t = 0; t < T; t++) o[x] = o[x] + w[t] * fe_i64(d[t * n + x]);
+    return o;
+  }
+  return e_fetch(run("fp_token_dots", R"(
+    ulong x = thread_position_in_grid.x, T = q[0], n = q[1]; GlE s = {0, 0, 0};
+    for (ulong t = 0; t < T; t++) { long y = v[t * n + x]; s = e_add(s, e_scale(e_ld(w, t), y < 0 ? gl_neg(gl_canonical((ulong)(-y))) : gl_canonical((ulong)y))); }
+    e_st(out, x, s);)", {v, e_array(w), words(std::vector<blk::u64>{T, n, 0, 0, 0, 0, 0, 0})}, {"v", "w", "q"}, {{(int)(3 * n)}}, n)[0]);
+}
+std::vector<blk::E> row_dots(const mx::array &v, size_t T, size_t n, const std::vector<blk::E> &w) {
+  if (reference_paths()) {
+    const int64_t *d = i64_data(v);
+    std::vector<blk::E> o(T, blk::E::zero());
+    for (size_t t = 0; t < T; t++) for (size_t x = 0; x < n; x++) o[t] = o[t] + w[x] * fe_i64(d[t * n + x]);
+    return o;
+  }
+  return e_fetch(run("fp_row_dots", R"(
+    ulong t = thread_position_in_grid.x, n = q[0]; GlE s = {0, 0, 0};
+    for (ulong x = 0; x < n; x++) { long y = v[t * n + x]; s = e_add(s, e_scale(e_ld(w, x), y < 0 ? gl_neg(gl_canonical((ulong)(-y))) : gl_canonical((ulong)y))); }
+    e_st(out, t, s);)", {v, e_array(w), words(std::vector<blk::u64>{n, 0, 0, 0, 0, 0, 0, 0})}, {"v", "w", "q"}, {{(int)(3 * T)}}, T)[0]);
+}
+std::vector<blk::E> rope_pairs(const mx::array &preq, const mx::array &prek, size_t H, size_t G, size_t dh, size_t T, const std::vector<blk::E> &ew, const blk::E &co) {
+  const size_t half = dh / 2;
+  if (reference_paths()) {
+    const int64_t *a = i64_data(preq), *b = i64_data(prek);
+    std::vector<blk::E> o(2 * half * T, blk::E::zero());
+    for (size_t pa = 0; pa < half; pa++)
+      for (size_t t = 0; t < T; t++)
+        for (size_t hd = 0; hd < H + G; hd++) {
+          const blk::E &w0 = ew[hd * dh + 2 * pa], &w1 = ew[hd * dh + 2 * pa + 1];
+          const int64_t *r = hd < H ? a + t * H * dh + hd * dh : b + t * G * dh + (hd - H) * dh;
+          const blk::E p0 = fe_i64(r[2 * pa]), p1 = fe_i64(r[2 * pa + 1]);
+          o[2 * (pa * T + t)] = o[2 * (pa * T + t)] + co * (w0 * p0 + w1 * p1);
+          o[2 * (pa * T + t) + 1] = o[2 * (pa * T + t) + 1] + co * (w1 * p0 - w0 * p1);
+        }
+    return o;
+  }
+  return e_fetch(run("fp_rope_pairs", R"(
+    ulong pa = thread_position_in_grid.x, t = thread_position_in_grid.y, H = q[0], G = q[1], dh = q[2], T = q[3];
+    GlE co = {q[4], q[5], q[6]}, c = {0, 0, 0}, s = {0, 0, 0};
+    for (ulong hd = 0; hd < H + G; hd++) {
+      GlE w0 = e_ld(ew, hd * dh + 2 * pa), w1 = e_ld(ew, hd * dh + 2 * pa + 1);
+      long y0 = hd < H ? a[t * H * dh + hd * dh + 2 * pa] : b[t * G * dh + (hd - H) * dh + 2 * pa];
+      long y1 = hd < H ? a[t * H * dh + hd * dh + 2 * pa + 1] : b[t * G * dh + (hd - H) * dh + 2 * pa + 1];
+      ulong p0 = y0 < 0 ? gl_neg(gl_canonical((ulong)(-y0))) : gl_canonical((ulong)y0), p1 = y1 < 0 ? gl_neg(gl_canonical((ulong)(-y1))) : gl_canonical((ulong)y1);
+      c = e_add(c, e_mul(co, e_add(e_scale(w0, p0), e_scale(w1, p1))));
+      s = e_add(s, e_mul(co, e_sub(e_scale(w1, p0), e_scale(w0, p1))));
+    }
+    e_st(out, 2 * (pa * T + t), c); e_st(out, 2 * (pa * T + t) + 1, s);)",
+    {preq, prek, e_array(ew), words(std::vector<blk::u64>{H, G, dh, T, co.c[0].v, co.c[1].v, co.c[2].v, 0})}, {"a", "b", "ew", "q"}, {{(int)(6 * half * T)}}, half, T)[0]);
+}
+mx::array stream_table(const mx::array &S, size_t NI, size_t T, size_t d, size_t P, unsigned limbs, const std::vector<blk::E> &gp, size_t n) {
+  if (reference_paths()) {
+    const int64_t *x = i64_data(S);
+    std::vector<blk::E> o(n, blk::E::zero());
+    for (size_t i = 0; i < NI; i++)
+      for (size_t j = 0; j < d; j++)
+        for (size_t t = 0; t < T; t++) {
+          long long v = x[(i * T + t) * d + j];
+          blk::E y = blk::E::zero();
+          for (unsigned l = 0; l < limbs; l++) {
+            long long c = (long long)(int32_t)v;
+            if (l + 1 < limbs) { c = ((v + 128) & 255) - 128; v = (v - c) >> 8; }
+            y = y + gp[l] * fe_i64(c);
+          }
+          o[(i * P + j) * T + t] = y;
+        }
+    return e_array(o);
+  }
+  mx::array z = e_rows_buffer(n);
+  const mx::array done = run("fp_stream_table", R"(
+    ulong j = thread_position_in_grid.x, r = thread_position_in_grid.y, T = q[0], d = q[1], P = q[2], L = q[3], i = r / T, t = r % T;
+    long v = S[(i * T + t) * d + j]; GlE y = {0, 0, 0};
+    for (ulong l = 0; l < L; l++) {
+      long c = (long)(int)v;
+      if (l + 1 < L) { c = ((v + 128) & 255) - 128; v = (v - c) >> 8; }
+      y = e_add(y, e_scale(e_ld(gp, l), c < 0 ? gl_neg((ulong)(-c)) : (ulong)c));
+    }
+    e_st((device ulong *)z, (i * P + j) * T + t, y);)", {S, e_array(gp), z, words(std::vector<blk::u64>{T, d, P, limbs, 0, 0, 0, 0})}, {"S", "gp", "z", "q"}, {{1}}, d, NI * T)[0];
+  mx::eval(done);
+  return z;
+}
+mx::array minus_rows(const mx::array &table, const mx::array &v, size_t cols, size_t first, size_t count, size_t index, size_t P, size_t T) {
+  return run("fp_minus_rows", R"(
+    ulong x = thread_position_in_grid.x, t = thread_position_in_grid.y, cols = q[0], first = q[1], index = q[2], P = q[3], T = q[4];
+    long y = -v[t * cols + first + x];
+    e_st((device ulong *)o, (index * P + x) * T + t, GlE{y < 0 ? gl_neg(gl_canonical((ulong)(-y))) : gl_canonical((ulong)y), 0, 0});)",
+    {table, v, words(std::vector<blk::u64>{cols, first, index, P, T, 0, 0, 0})}, {"o", "v", "q"}, {{1}}, count, T)[0];
+}
+blk::E dot3(const std::vector<blk::E> &w, const mx::array &a, const mx::array &b) {
+  const size_t n = w.size(), T = std::min<size_t>(n, 1 << 14);
+  const mx::array p = run("fp_dot3", R"(
+    ulong i = thread_position_in_grid.x, T = q[0], n = q[1]; GlE s = {0, 0, 0};
+    for (ulong j = i; j < n; j += T) s = e_add(s, e_mul(e_ld(w, j), e_mul(e_ld(a, j), e_ld(b, j))));
+    e_st(out, i, s);)", {e_array(w), a, b, words(std::vector<blk::u64>{T, n, 0, 0, 0, 0, 0, 0})}, {"w", "a", "b", "q"}, {{(int)(3 * T)}}, T)[0];
+  return sum_partials(p, T, 0, 3);
+}
 }

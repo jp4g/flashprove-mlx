@@ -221,6 +221,39 @@ int main() {
     }
     report("lookup table side", ok);
   }
+  { // forward-pass values: each kernel against its host path, negative values and values above 2^32 among them
+    const size_t T = 16, n = 96;
+    std::vector<int64_t> v(T * n), v2(T * n);
+    for (auto &x : v) x = (int64_t)(g() % 2000000) - 1000000;
+    for (auto &x : v2) x = ((int64_t)(g() % 2000000) - 1000000) * 100000;
+    const mx::array a(v.data(), {(int)T, (int)n}, mx::int64), b(v2.data(), {(int)T, (int)n}, mx::int64);
+    std::vector<E> wt(T), wn(n);
+    for (E &x : wt) x = rnd();
+    for (E &x : wn) x = rnd();
+    auto both = [&](const char *name, auto f) { reference_paths() = true; const auto h = f(); reference_paths() = false; const auto k = f(); report(name, !memcmp(h.data(), k.data(), h.size() * sizeof(h[0]))); };
+    both("token dots", [&] { return token_dots(a, T, n, wt); });
+    both("token dots, large values", [&] { return token_dots(b, T, n, wt); });
+    both("row dots", [&] { return row_dots(a, T, n, wn); });
+    both("row dots, large values", [&] { return row_dots(b, T, n, wn); });
+    { const size_t H = 2, G = 1, dh = 16; std::vector<E> ew((H + G) * dh); for (E &x : ew) x = rnd(); const E co = rnd();
+      std::vector<int64_t> q(T * H * dh), k(T * G * dh); for (auto &x : q) x = (int64_t)(g() % 2000000) - 1000000; for (auto &x : k) x = (int64_t)(g() % 2000000) - 1000000;
+      const mx::array Q(q.data(), {(int)T, (int)(H * dh)}, mx::int64), Kk(k.data(), {(int)T, (int)(G * dh)}, mx::int64);
+      both("rope pairs", [&] { return rope_pairs(Q, Kk, H, G, dh, T, ew, co); }); }
+    { std::vector<E> gp(5); for (E &x : gp) x = rnd();
+      std::vector<int64_t> st(4 * T * 32); for (auto &x : st) x = ((int64_t)g()) >> 26;
+      const mx::array S(st.data(), {(int)st.size()}, mx::int64);
+      both("stream table", [&] { return e_fetch(stream_table(S, 4, T, 32, 64, 5, gp, 4 * 64 * T)); }); }
+    { const size_t cnt = 40, P = 64, idx = 2, first = 7;
+      mx::array o = e_rows_buffer(4 * P * T);
+      mx::eval(minus_rows(o, a, n, first, cnt, idx, P, T));
+      const std::vector<E> got = e_fetch(o);
+      std::vector<E> want(4 * P * T, E::zero());
+      for (size_t x = 0; x < cnt; x++) for (size_t t = 0; t < T; t++) want[(idx * P + x) * T + t] = E::from(from_i64(-v[t * n + first + x]));
+      report("minus rows", !memcmp(got.data(), want.data(), want.size() * 24)); }
+    { std::vector<E> w(1000), x(1000), y(1000); E want = E::zero();
+      for (size_t i = 0; i < 1000; i++) w[i] = rnd(), x[i] = rnd(), y[i] = rnd(), want = want + w[i] * x[i] * y[i];
+      report("dot3", dot3(w, e_on_gpu(x), e_on_gpu(y)) == want); }
+  }
   printf("%d of %d kernels equal\n", runs - bad, runs);
   return bad != 0;
 }
