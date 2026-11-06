@@ -257,7 +257,7 @@ public:
     f->ell = code.ell, f->r = code.r, f->rows = rows;
     // On the GPU a fold's rows are gathered from its tables' words; a tiny one is not worth it.
     const bool gather = !fpmlx::in_forked_child() && rows * f->ell >= 8 && rows * f->r >= 8;
-    fpmlx::mx::array gm(0), gt(0);
+    std::optional<fpmlx::mx::array> gm, gt; // no array is made in a forked child: Metal does not survive a fork
     std::vector<fpmlx::mx::array> gathered;
     if (gather) gm = fpmlx::e_rows_buffer(rows * f->ell), gt = fpmlx::e_rows_buffer(rows * f->r);
     else f->m.assign(rows * f->ell, E::zero()), f->tail.assign(rows * f->r, E::zero());
@@ -276,8 +276,8 @@ public:
         taken[p.first_row + b] = true;
       }
       if (gather) {
-        gathered.push_back(fpmlx::put_rows(gm, fpmlx::table_words(m), p.first_row));
-        gathered.push_back(fpmlx::put_rows(gt, fpmlx::table_words(cm.tail[p.part]), p.first_row));
+        gathered.push_back(fpmlx::put_rows(*gm, fpmlx::table_words(m), p.first_row));
+        gathered.push_back(fpmlx::put_rows(*gt, fpmlx::table_words(cm.tail[p.part]), p.first_row));
       } else for (size_t b = 0; b < m.rows; b++) {
         for (size_t i = 0; i < f->ell; i++) f->m[(p.first_row + b) * f->ell + i] = m.at(b, i);
         for (size_t i = 0; i < f->r; i++) f->tail[(p.first_row + b) * f->r + i] = cm.tail[p.part].at(b, i);
@@ -291,7 +291,7 @@ public:
     for (const EngineTerm &t : c.engine_terms) f->hinted.push_back(t.vector);
     for (const Tensor &v : c.tensors)
       if (v.is_held()) f->hinted.push_back(v.held);  // a dense factor stored in a table
-    if (gather) fpmlx::mx::eval(gathered), f->gm = fpmlx::Buf(gm), f->gt = fpmlx::Buf(gt);
+    if (gather) fpmlx::mx::eval(gathered), f->gm = fpmlx::Buf(*gm), f->gt = fpmlx::Buf(*gt);
     else f->gm = fpmlx::e_upload(f->m), f->gt = fpmlx::e_upload(f->tail);
     if (dense.on_gpu()) f->gc = fpmlx::rows_first(dense, rows, f->ell);
     else {
