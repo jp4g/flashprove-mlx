@@ -106,7 +106,16 @@ int main(int argc, char **argv) {
     const CoinKey seed = load_or_make_seed(seedf.c_str());
     auto leaf_coins = seeded_coins(seed, COINS_LEAF);
     // A request's masks must be fresh: two proofs under one mask would show differences of hidden values.
+#ifdef FPMLX_TEST_FIXED_COINS
+    // Only in the test program fp_prove_fixed: the same masks in every proof, which would break hiding.
+    CoinKey fixed{};
+    for (int i = 0; i < 8; i++) fixed.w[i] = 0x51ed2700u + i;
+    auto coins = std::make_unique<MetalCoins>(fixed, CoinContext{});
+    if (getenv("FP_TEST_REFERENCE")) reference_paths() = true, psc_gpu_min() = 0;
+    if (getenv("FP_TEST_FAULT")) test_fault() = atoi(getenv("FP_TEST_FAULT"));
+#else
     auto coins = run_coins_without_a_seed<MetalCoins>(CoinInputs().add("a request", req).finish(), CoinContext{});
+#endif
     // MLX keeps freed buffers for reuse, by default as much again as is in use.
     mx::set_cache_limit((size_t)(atof(getenv("FP_MLX_CACHE_GB") ? getenv("FP_MLX_CACHE_GB") : "4") * 1e9));
     EngineMlx engine;
@@ -163,7 +172,7 @@ int main(int argc, char **argv) {
       // The feed-forward segment.
       double ts = now();
       const size_t lg = 2 * g, la = lg + 1;
-      FFGroup G = ff_build(pol, shape, V, tabs, g);
+      FFGroup G = ff_build(pol, shape, V, tabs, g, !reference_paths());
       FFProver pr(in, G, tabs);
       pr.prepare(g == 0);
       SegMask mask = make_mask(P, sh, lg);
@@ -185,7 +194,7 @@ int main(int argc, char **argv) {
       printf("G%d: %.1f s, %u scalars, %zu bytes so far\n", g, now() - ts, slot, file.size());
       // The attention segment.
       ts = now();
-      AttnGroup A = attn_build(pol, shape, G, g, &V);
+      AttnGroup A = attn_build(pol, shape, G, g, reference_paths() ? nullptr : &V);
       if (!A.keys_ok) { fprintf(stderr, "fp_prove: a key of attention is in no row\n"); return 3; }
       SegMask am = make_mask(P, sh, la);
       Arrays arrays = named(attn_arrays(A));
@@ -216,7 +225,7 @@ int main(int argc, char **argv) {
       const size_t lh = 2 * NG;
       HeadRequest q = HeadRequest::read(req, shape.T);
       q.y = y;
-      HeadWitness H = head_build(pol, shape, V, tabs, q);
+      HeadWitness H = head_build(pol, shape, V, tabs, q, !reference_paths());
       if (!H.norm_ok || !H.margins_ok || !H.bounds_ok) { fprintf(stderr, "fp_prove: the head's witness fails: norm %d margins %d bounds %d\n", H.norm_ok, H.margins_ok, H.bounds_ok); return 3; }
       HeadProof hp(H, wi.at("Wh"));
       SegMask hm = make_mask(P, sh, lh);

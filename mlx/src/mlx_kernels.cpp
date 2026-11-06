@@ -15,6 +15,8 @@ namespace fpmlx {
 static bool child_of_fork = false;
 static const bool watching = [] { pthread_atfork(nullptr, nullptr, [] { child_of_fork = true; }); return true; }();
 bool in_forked_child() { return child_of_fork; }
+bool &reference_paths() { static bool on = false; return on; }
+int &test_fault() { static int n = 0; return n; }
 Buf::Buf(const mx::array &a) {
   mx::eval(a);
   a_ = std::shared_ptr<mx::array>(new mx::array(a), [](mx::array *x) { if (!in_forked_child()) delete x; });
@@ -531,6 +533,11 @@ static blk::u64 bits_taken(blk::u64 x, blk::u64 mask) { // the bits of x at mask
   return r;
 }
 Buf tensors_written(const std::vector<blk::Tensor> &ts, unsigned vars) {
+  if (reference_paths()) {
+    std::vector<blk::E> v(size_t(1) << vars, blk::E::zero()), room;
+    for (const blk::Tensor &t : ts) t.add_to(v.data(), room);
+    return Buf(e_array(v));
+  }
   BLK_REQUIRE(vars >= 8 && vars < 31, "tensors on the GPU: a vector of this length");
   const size_t T = ts.size();
   // Lane bits.
@@ -612,6 +619,16 @@ Buf chacha_words(const blk::u32 key[8], blk::u32 stream, size_t n) {
                  {words(p)}, {"p"}, {{(int)n}}, calls)[0]);
 }
 Buf combinations(const int32_t *cells, size_t m, size_t k, const signed char *theta, size_t tau) {
+  if (reference_paths()) {
+    std::vector<blk::u64> o(m * tau);
+    for (size_t u = 0; u < tau; u++)
+      for (size_t i = 0; i < m; i++) {
+        long long s = 0;
+        for (size_t c = 0; c < k; c++) s += (long long)theta[c * tau + u] * cells[i * k + c];
+        o[u * m + i] = (s < -(1 << 17) || s >= (1 << 17)) ? ~blk::u64(0) : (blk::u64)(s + (1 << 17));
+      }
+    return Buf(words(o));
+  }
   const mx::array c(cells, {(int)(m * k)}, mx::int32), t(reinterpret_cast<const int8_t *>(theta), {(int)(k * tau)}, mx::int8);
   return Buf(run("fp_combinations",
                  "ulong i = thread_position_in_grid.x, u = thread_position_in_grid.y, m = p[0], k = p[1], tau = p[2];"
@@ -620,9 +637,17 @@ Buf combinations(const int32_t *cells, size_t m, size_t k, const signed char *th
                  {c, t, words(std::vector<blk::u64>{m, k, tau})}, {"ce", "th", "p"}, {{(int)(m * tau)}}, m, tau)[0]);
 }
 mx::array product_level(const mx::array &below) {
+  if (reference_paths()) {
+    const std::vector<blk::E> a = e_fetch(below);
+    std::vector<blk::E> v(a.size() / 2);
+    for (size_t i = 0; i < v.size(); i++) v[i] = a[i] * a[i + v.size()];
+    return e_array(v);
+  }
   const size_t h = below.size() / 6;
-  return run("fp_product_level", "ulong i = thread_position_in_grid.x, h = p[0]; e_st(out, i, e_mul(e_ld(a, i), e_ld(a, i + h)));",
-             {below, words(std::vector<blk::u64>{h})}, {"a", "p"}, {{(int)(3 * h)}}, h)[0];
+  const mx::array level = run("fp_product_level", "ulong i = thread_position_in_grid.x, h = p[0]; e_st(out, i, e_mul(e_ld(a, i), e_ld(a, i + h)));",
+                              {below, words(std::vector<blk::u64>{h})}, {"a", "p"}, {{(int)(3 * h)}}, h)[0];
+  if (test_fault() > 0 && --test_fault() == 0) { mx::eval(level); const_cast<uint64_t *>(level.data<uint64_t>())[0] ^= 1; }
+  return level;
 }
 std::vector<blk::E> e_fetch(const mx::array &a) {
   mx::eval(a);
@@ -632,6 +657,16 @@ std::vector<blk::E> e_fetch(const mx::array &a) {
 }
 mx::array e_on_gpu(const std::vector<blk::E> &v) { return e_array(v); }
 mx::array lookup_leaves(const LeafPlan &L, const std::vector<blk::u64> &keys, const std::vector<char> &padding) {
+  if (reference_paths()) {
+    std::vector<blk::E> v(size_t(1) << L.v);
+    for (size_t i = 0; i < v.size(); i++) {
+      const blk::u64 y = i & ((blk::u64(1) << L.rK) - 1), x = i >> L.rK;
+      if (y >= L.NT) { v[i] = L.pad0; continue; }
+      const blk::u64 c = L.tree_call[y], at = L.tree_first[y] + x, value = padding[at] ? L.pad_value[c] : keys[at];
+      v[i] = L.alpha - (blk::E::from(blk::from_u64(value)) + blk::E::from(blk::from_u64(c)) * L.theta);
+    }
+    return e_array(v);
+  }
   std::vector<blk::u64> p = {L.rK, L.dT, L.NT};
   for (const blk::E &e : {L.alpha, L.theta, L.pad0}) for (blk::u64 c : e_words(e)) p.push_back(c);
   const mx::array pad(reinterpret_cast<const uint8_t *>(padding.data()), {(int)padding.size()}, mx::uint8);
@@ -646,6 +681,13 @@ mx::array lookup_leaves(const LeafPlan &L, const std::vector<blk::u64> &keys, co
              {words(L.tree_call), words(L.tree_first), words(L.pad_value), words(keys), pad, words(p)}, {"tc", "tf", "pv", "ks", "pd", "p"}, {{(int)(3 * n)}}, n)[0];
 }
 Buf column_sums(const int32_t *cells, size_t k, size_t nb, const std::vector<blk::E> &phi) {
+  if (reference_paths()) {
+    std::vector<blk::E> o(k * nb, blk::E::zero());
+    for (size_t x = 0; x < k; x++)
+      for (size_t b = 0; b < nb; b++)
+        for (size_t r = 0; r < phi.size(); r++) o[x * nb + b] = o[x * nb + b] + phi[r] * blk::from_i64(cells[(b * phi.size() + r) * k + x]);
+    return Buf(e_array(o));
+  }
   const size_t len = phi.size();
   const mx::array c(cells, {(int)(nb * len * k)}, mx::int32);
   return Buf(run("fp_column_sums",
@@ -704,6 +746,18 @@ Buf encode_table(const TableWords &m, const TableWords &tl, size_t message_at, s
   return encode_array(c, rows, ld, log_n, tw);
 }
 TableSide lookup_table_side(unsigned kT, unsigned cK, unsigned NC, const std::vector<blk::u64> &rows, const std::vector<blk::u32> &mult, const blk::E &alpha, const blk::E &theta) {
+  if (reference_paths()) {
+    const size_t n = size_t(1) << (5 + kT + cK);
+    std::vector<blk::E> br(2 * n), lv(n);
+    for (size_t i = 0; i < n; i++) {
+      const blk::u64 j = i & 31, c = (i >> 5) & ((blk::u64(1) << cK) - 1), t = i >> (5 + cK), cc = std::min<blk::u64>(c, NC - 1);
+      const blk::E rv = blk::E::from(blk::from_u64(rows[(cc << kT) + t])) + blk::E::from(blk::from_u64(cc)) * theta;
+      br[i] = (c < NC && ((mult[(c << kT) + t] >> j) & 1)) ? blk::E::one() : blk::E::zero();
+      br[n + i] = alpha - blk::E::one() - rv;
+      lv[i] = blk::E::one() + br[i] * br[n + i];
+    }
+    return {e_array(br), e_array(lv)};
+  }
   const unsigned nT = 5 + kT + cK;
   const size_t n = size_t(1) << nT;
   std::vector<blk::u64> p = {cK, NC, kT, n};
@@ -744,6 +798,13 @@ mx::array index_message(const int8_t *cells, size_t rows, size_t columns, size_t
     out[r * ell + j] = v;)", {c, words(pd), words(std::vector<blk::u64>{rows, columns, ell, per, plain, pads_each, 0, 0})}, {"ce", "pd", "q"}, {{(int)(table_rows * ell)}}, ell, table_rows)[0];
 }
 std::vector<blk::E> rows_left(const mx::array &m, size_t rows, size_t len, const std::vector<blk::E> &w) {
+  if (reference_paths()) {
+    mx::eval(m);
+    const blk::u64 *d = reinterpret_cast<const blk::u64 *>(m.data<uint64_t>());
+    std::vector<blk::E> o(len, blk::E::zero());
+    for (size_t x = 0; x < rows; x++) for (size_t j = 0; j < len; j++) o[j] = o[j] + w[x] * blk::F{d[x * len + j]};
+    return o;
+  }
   const mx::array o = run("fp_rows_left", R"(
     ulong j = thread_position_in_grid.x, rows = q[0], len = q[1]; GlE s = {0, 0, 0};
     for (ulong x = 0; x < rows; x++) s = e_add(s, e_scale(e_ld(w, x), m[x * len + j]));
@@ -751,6 +812,17 @@ std::vector<blk::E> rows_left(const mx::array &m, size_t rows, size_t len, const
   return e_fetch(o);
 }
 bool lookup_counts(const std::vector<blk::u64> &keys, const std::vector<char> &padding, unsigned k, const std::vector<blk::u64> &values, const std::vector<blk::u32> &rows, blk::u32 *count) {
+  if (reference_paths()) {
+    std::fill(count, count + (size_t(1) << k), 0);
+    for (size_t i = 0; i < keys.size(); i++) {
+      if (padding[i]) continue;
+      if (values.empty()) { if (keys[i] >> k) return false; count[keys[i]]++; continue; }
+      const auto it = std::lower_bound(values.begin(), values.end(), keys[i]);
+      if (it == values.end() || *it != keys[i]) return false;
+      count[rows[it - values.begin()]]++;
+    }
+    return true;
+  }
   std::vector<blk::u64> v = values;
   std::vector<uint32_t> r(rows.begin(), rows.end());
   const size_t tn = v.size();
@@ -830,6 +902,12 @@ static const mx::array &matrix_on_gpu(const int8_t *matrix, size_t n) {
   return *kept;
 }
 Buf matrix_left(const int8_t *matrix, size_t cells, size_t first, size_t rows, size_t columns, const std::vector<blk::E> &g) {
+  if (reference_paths()) {
+    std::vector<blk::E> o(columns, blk::E::zero());
+    for (size_t y = 0; y < rows; y++)
+      for (size_t x = 0; x < columns; x++) o[x] = o[x] + g[y] * blk::from_i64(matrix[(first + y) * columns + x]);
+    return Buf(e_array(o));
+  }
   return Buf(run("fp_matrix_left",
                  "ulong x = thread_position_in_grid.x, columns = p[0], rows = p[1], first = p[2]; GlE s = {0, 0, 0};"
                  "for (ulong y = 0; y < rows; y++) { long v = ce[(first + y) * columns + x]; if (v) s = e_add(s, e_scale(e_ld(g, y), v < 0 ? GL_P - (ulong)(-v) : (ulong)v)); }"
@@ -837,6 +915,16 @@ Buf matrix_left(const int8_t *matrix, size_t cells, size_t first, size_t rows, s
                  {matrix_on_gpu(matrix, cells), e_array(g), words(std::vector<blk::u64>{columns, rows, first})}, {"ce", "g", "p"}, {{(int)(3 * columns)}}, columns)[0]);
 }
 Buf pack_cells(const int32_t *cells, size_t m, size_t k) {
+  if (reference_paths()) {
+    std::vector<blk::u64> o((m + 2) / 3 * k);
+    for (size_t i = 0; i < (m + 2) / 3; i++)
+      for (size_t c = 0; c < k; c++) {
+        long long v = 0;
+        for (int q = 2; q >= 0; q--) { const size_t r = 3 * i + q; v = (long long)((__int128)v * (1 << 20)) + (r < m ? cells[r * k + c] : 0); }
+        o[i * k + c] = blk::from_i64(v).v;
+      }
+    return Buf(words(o));
+  }
   const mx::array c(cells, {(int)(m * k)}, mx::int32);
   const size_t rows = (m + 2) / 3;
   return Buf(run("fp_pack_cells", R"(

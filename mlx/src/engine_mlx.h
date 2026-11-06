@@ -163,7 +163,7 @@ public:
     mine();
     const Table &t = table(id);
     BLK_REQUIRE((u64(1) << v.vars()) == t.entries(), "evaluate: the vector and the table differ in length");
-    if (!v.is_held() && v.vars() >= 12 && !fpmlx::in_forked_child()) return dot_with_table(fpmlx::tensors_written({v}, v.vars()), t);
+    if (!v.is_held() && v.vars() >= 12 && !fpmlx::in_forked_child() && !fpmlx::reference_paths()) return dot_with_table(fpmlx::tensors_written({v}, v.vars()), t);
     std::vector<E> w(t.entries(), E::zero());
     (v.is_held() ? readable(v) : v).add_to(w.data());
     return dot_with_table(w, t);
@@ -256,7 +256,7 @@ public:
     const size_t rows = size_t(1) << k;
     f->ell = code.ell, f->r = code.r, f->rows = rows;
     // On the GPU a fold's rows are gathered from its tables' words; a tiny one is not worth it.
-    const bool gather = !fpmlx::in_forked_child() && rows * f->ell >= 8 && rows * f->r >= 8;
+    const bool gather = !fpmlx::in_forked_child() && !fpmlx::reference_paths() && rows * f->ell >= 8 && rows * f->r >= 8;
     std::optional<fpmlx::mx::array> gm, gt; // no array is made in a forked child: Metal does not survive a fork
     std::vector<fpmlx::mx::array> gathered;
     if (gather) gm = fpmlx::e_rows_buffer(rows * f->ell), gt = fpmlx::e_rows_buffer(rows * f->r);
@@ -383,7 +383,7 @@ private:
   // The Form's vector, `length` entries at the least. The Tensors are written on the GPU; what is left
   // of a Form, its few single entries and the engine's terms, is added to the same memory.
   fpmlx::Buf written_form(const Form &c, size_t length, unsigned vars) {
-    if (fpmlx::in_forked_child() || vars < 12 || !c.frozen.empty() || c.has_held_factor()) {
+    if (fpmlx::in_forked_child() || fpmlx::reference_paths() || vars < 12 || !c.frozen.empty() || c.has_held_factor()) {
       std::vector<E> w(length, E::zero());
       write_out(c, w, vars);
       const u64 *p = reinterpret_cast<const u64 *>(w.data());
@@ -473,7 +473,7 @@ private:
   }
   E dot_with_table(const std::vector<E> &w, const Table &t) { return dot_with_table(fpmlx::e_upload(w), t); }
   E dot_with_table(const fpmlx::Buf &w, const Table &t) {
-    if (fpmlx::in_forked_child() || !w.on_gpu()) {
+    if (fpmlx::in_forked_child() || !w.on_gpu() || fpmlx::reference_paths()) {
       std::vector<E> entries(t.entries());
       for (u64 j = 0; j < t.entries(); j++) entries[j] = t.entry(j);
       return fpmlx::dot(w, fpmlx::e_upload(entries));

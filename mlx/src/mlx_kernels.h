@@ -21,6 +21,13 @@ mx::array e_mul(const mx::array &a, const mx::array &b);
 // a Buf holds host words and each operation below takes a plain host path. An array that a child
 // inherits is read, not released.
 bool in_forked_child();
+// A test's switch: the witness, lookup and form kernels take their plain host paths, so that a whole proof
+// can be compared with the kernels' (mlx/tests/whole_proof_test.sh). Encoding, the trees and the nonce search
+// stay on the GPU: engine_test compares those.
+bool &reference_paths();
+// In the test of that comparison: n > 0 corrupts the n-th product level of a lookup, so that the test can show
+// that it would see a wrong kernel.
+int &test_fault();
 class Buf {
 public:
   Buf() = default;

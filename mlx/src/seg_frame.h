@@ -38,6 +38,16 @@ inline std::vector<TableId> place_tables(ProverContext &P, const ReqLayout &lay,
     const OracleShape &o = msgs[mi].shape;
     if (!o.main_rows) { ids.push_back(NO_ID); continue; }
     Table t(o.main_deg, o.main_rows, codes.base[o.code].ell);
+    if (reference_paths()) {
+      for (const ReqArray &a : lay.link[link]) {
+        if (a.message != mi) continue;
+        auto it = arrays.find(a.name);
+        if (it == arrays.end()) throw std::runtime_error("no array named " + a.name + " at link " + std::to_string(link));
+        for (const LaidBlock &b : a.laid.blocks) lay_block(t, b, it->second);
+      }
+      ids.push_back(P.engine.put(t));
+      continue;
+    }
     // The table's words are written on the GPU, block by block, and read back once.
     mx::array words(mx::allocator::malloc(t.a.size() * 8), {(int)t.a.size()}, mx::uint64);
     memset(words.data<uint64_t>(), 0, t.a.size() * 8);
