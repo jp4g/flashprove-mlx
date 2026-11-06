@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
     if (getenv("FP_STOP_AFTER_TABLE")) { fpmlx::IndexMlx t(S, M, *coins, c.configuration()); printf("table only: %.1f s\n", now() - t0); return 0; }
     fpmlx::IndexMlx first(S, M, *coins, c.configuration());
     printf("anchor table: %.1f s\n", now() - t0); fflush(stdout);
-    fpmlx::WfMlx ranges(f.ranges, wf_matrix_of(S), [&](u64 row, u64 column) { return from_i64(cells[row * columns + column]); });
+    fpmlx::WfMlx ranges(f.ranges, wf_matrix_of(S), cells, raw.size(), columns);
     fpmlx::MemberMlx products(S, M);
     Writer key;
     const double t1 = now();

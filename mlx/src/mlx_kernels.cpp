@@ -778,6 +778,50 @@ bool lookup_counts(const std::vector<blk::u64> &keys, const std::vector<char> &p
   memcpy(count, cnt.data<uint32_t>(), 4 * cn);
   return flag.data<uint32_t>()[0] == 0;
 }
+static const mx::array &matrix_on_gpu(const int8_t *matrix, size_t n);
+mx::array wf_run(const mx::array &keys, const mx::array &pad, const int8_t *matrix, size_t cells, size_t columns, size_t first, size_t first_row, size_t places, size_t stride, blk::F offset, const std::vector<blk::F> &weights) {
+  std::vector<blk::u64> p = {columns, first, first_row, stride, offset.v, weights.size(), 0, 0};
+  for (const blk::F &w : weights) p.push_back(w.v);
+  return run("fp_wf_run", R"(
+    ulong c = thread_position_in_grid.x, i = thread_position_in_grid.y, columns = q[0], first = q[1], row0 = q[2], stride = q[3], n = q[5], key = q[4];
+    for (ulong d = 0; d < n; d++) {
+      long v = ce[(row0 + i + d * stride) * columns + c];
+      key = gl_add(key, gl_mul(q[8 + d], v < 0 ? GL_P - (ulong)(-v) : (ulong)v));
+    }
+    ulong at = first + c + i * columns;
+    ((device ulong *)ks)[at] = key, ((device uchar *)pd)[at] = 0;)", {keys, pad, matrix_on_gpu(matrix, cells), words(p)}, {"ks", "pd", "ce", "q"}, {{1}}, columns, places)[0];
+}
+mx::array lkp_leaves(const mx::array &keys, size_t first, unsigned v, unsigned g, const std::vector<blk::u64> &blocks, const std::vector<blk::E> &rows, const blk::E &alpha, const blk::E &theta) {
+  std::vector<blk::u64> p = {first, g, rows.size(), 0};
+  for (const blk::E &e : {alpha, theta}) for (blk::u64 c : e_words(e)) p.push_back(c);
+  std::vector<blk::u64> b = blocks;
+  b.resize(std::max<size_t>(b.size(), 8), 0);
+  const size_t n = size_t(1) << v;
+  return run("fp_lkp_leaves", R"(
+    ulong i = thread_position_in_grid.x, first = q[0], g = q[1], nb = q[2], y = i & ((1ul << g) - 1);
+    GlE alpha = {q[4], q[5], q[6]}, theta = {q[7], q[8], q[9]};
+    for (ulong b = 0; b < nb; b++) {
+      ulong lt = bl[3 * b + 1];
+      if ((y >> lt) != (bl[3 * b] >> lt)) continue;
+      ulong f = bl[3 * b + 2];
+      GlE x;
+      if (f == 0) x = e_ld(rw, b);
+      else { x = e_scale(theta, f - 1); x.c0 = gl_add(x.c0, ks[first + i]); }
+      e_st(out, i, e_sub(alpha, x));
+      return;
+    })", {keys, words(b), e_scalars(rows), words(p)}, {"ks", "bl", "rw", "q"}, {{(int)(3 * n)}}, n)[0];
+}
+mx::array lkp_pad(const mx::array &leaves, size_t at, unsigned step, size_t length, const blk::E &value) {
+  return run("fp_lkp_pad", "ulong i = thread_position_in_grid.x; e_st((device ulong *)a, q[0] + (i << q[1]), GlE{q[2], q[3], q[4]});",
+             {leaves, words(std::vector<blk::u64>{at, step, value.c[0].v, value.c[1].v, value.c[2].v, 0, 0, 0})}, {"a", "q"}, {{1}}, length)[0];
+}
+TableSide lkp_table_side(const mx::array &bits, const mx::array &table, size_t w, const blk::E &alpha) {
+  const size_t n = bits.size() / 3;
+  const mx::array R = run("fp_lkp_rows", "ulong i = thread_position_in_grid.x, w = q[0]; e_st(out, i, e_sub(e_sub(GlE{q[1], q[2], q[3]}, GlE{1, 0, 0}), e_ld(t, i / w)));",
+                          {table, words(std::vector<blk::u64>{w, alpha.c[0].v, alpha.c[1].v, alpha.c[2].v, 0, 0, 0, 0})}, {"t", "q"}, {{(int)(3 * n)}}, n)[0];
+  const mx::array L = run("fp_lkp_table_leaves", "ulong i = thread_position_in_grid.x; e_st(out, i, e_add(GlE{1, 0, 0}, e_mul(e_ld(b, i), e_ld(r, i))));", {bits, R}, {"b", "r"}, {{(int)(3 * n)}}, n)[0];
+  return {R, L};
+}
 static const mx::array &matrix_on_gpu(const int8_t *matrix, size_t n) {
   static const int8_t *at = nullptr;
   static size_t size = 0;

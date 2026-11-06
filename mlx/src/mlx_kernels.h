@@ -55,6 +55,7 @@ Buf combinations(const int32_t *cells, size_t m, size_t k, const signed char *th
 // The sum of Tensors written out, 2^vars entries of E, each thread summing one entry. The words may be
 // changed by the caller until the Buf is given to a kernel.
 Buf tensors_written(const std::vector<blk::Tensor> &tensors, unsigned vars);
+struct TableSide { mx::array bits_rows, leaves; };
 // Tables on the GPU: the words of a blk::Table, a[(row * len + place) * deg + coordinate].
 struct TableWords { Buf a; unsigned deg = 1, log_rows = 0; size_t rows = 0, len = 0; };
 TableWords table_words(const blk::Table &t);
@@ -74,6 +75,15 @@ void add_term(const Buf &out, const TableWords &t, const blk::E &scale, blk::u64
 mx::array index_message(const int8_t *cells, size_t rows, size_t columns, size_t table_rows, size_t ell, size_t per, size_t plain, const std::vector<blk::u64> &pads, size_t pads_each);
 // out[j] = sum_x w[x] m[x len + j], m in F.
 std::vector<blk::E> rows_left(const mx::array &m, size_t rows, size_t len, const std::vector<blk::E> &w);
+// The commitment's lookups (blocks/iop/wf.h, lkp.h). wf_run: keys of a run, in place in `keys`, a word of F each:
+// offset + sum_q weight[q] cell(first_row + i + q stride, c) at place first + c + i columns; padding flag cleared.
+mx::array wf_run(const mx::array &keys, const mx::array &pad, const int8_t *matrix, size_t matrix_cells, size_t columns, size_t first, size_t first_row, size_t places, size_t stride, blk::F offset, const std::vector<blk::F> &weights);
+// A part's leaves: blocks is by (first, log_trees, function + 1), with `rows` the padding row of each.
+mx::array lkp_leaves(const mx::array &keys, size_t first, unsigned v, unsigned g, const std::vector<blk::u64> &blocks, const std::vector<blk::E> &rows, const blk::E &alpha, const blk::E &theta);
+// leaves[p + (i << step)] = value, for i < length; in place.
+mx::array lkp_pad(const mx::array &leaves, size_t p, unsigned step, size_t length, const blk::E &value);
+// R[i] = alpha - 1 - table[i / w], and 1 + bits[i] R[i].
+TableSide lkp_table_side(const mx::array &bits, const mx::array &table, size_t w, const blk::E &alpha);
 // count[row] += 1 for each key that is not padding, row being the key (no table) or its place in the table:
 // `values` ascending, `rows` beside them, the lowest row first among equals. False: a key is in no row.
 bool lookup_counts(const std::vector<blk::u64> &keys, const std::vector<char> &padding, unsigned k, const std::vector<blk::u64> &values, const std::vector<blk::u32> &rows, blk::u32 *count);
@@ -95,7 +105,6 @@ struct LeafPlan {
 mx::array lookup_leaves(const LeafPlan &p, const std::vector<blk::u64> &keys, const std::vector<char> &padding);
 // A lookup's table side. Leaf i = (t | c | j). rows: by call, 2^kT row values each (the call's table
 // repeated); mult: by call, 2^kT counts. bits_rows: the two maps b and alpha - 1 - row, one after the other.
-struct TableSide { mx::array bits_rows, leaves; };
 TableSide lookup_table_side(unsigned kT, unsigned cK, unsigned NC, const std::vector<blk::u64> &rows, const std::vector<blk::u32> &mult, const blk::E &alpha, const blk::E &theta);
 // Smallness::u3(): entry c nb + b is the sum over r < len of phi[r] cells[(b len + r) k + c].
 Buf column_sums(const int32_t *cells, size_t k, size_t nb, const std::vector<blk::E> &phi);
