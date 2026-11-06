@@ -60,6 +60,18 @@ int main(int c, char **v) {
   q.y = head_next_token(V, q, T);
   const CallTables tabs = call_tables(w);
   HeadWitness W = head_build(pol, m, V, tabs, q);
+  { // The GPU's witness against the host's, word by word.
+    const HeadWitness B = head_build(pol, m, V, tabs, q, false);
+    size_t diff = 0, n = 0;
+    auto cmp = [&](const FeatMat &x, const FeatMat &y) { for (size_t p = 0; p < x.part.size(); p++) { n += x.part[p].cell.size(); for (size_t i = 0; i < x.part[p].cell.size(); i++) diff += x.part[p].cell[i] != y.part[p].cell[i]; } };
+    cmp(W.hf, B.hf), cmp(W.hd, B.hd), cmp(W.hr, B.hr), cmp(W.xbL, B.xbL);
+    size_t dk = 0, nk = 0;
+    for (size_t c = 0; c < W.calls.size(); c++) { nk += W.calls[c].keys.size(); for (size_t i = 0; i < W.calls[c].keys.size(); i++) dk += W.calls[c].keys[i] != B.calls[c].keys[i] || W.calls[c].padding[i] != B.calls[c].padding[i]; }
+    bool same = W.price == B.price && W.hidden == B.hidden && W.mult == B.mult && W.str == B.str && W.act == B.act && W.lam == B.lam && W.norm_ok == B.norm_ok && W.margins_ok == B.margins_ok && W.bounds_ok == B.bounds_ok && W.keys_ok == B.keys_ok && W.bH.cell == B.bH.cell;
+    for (int t = 0; t < W.s.T; t++) { const NormRow &x = W.rows[t], &y = B.rows[t]; same = same && x.D == y.D && x.a == y.a && x.b == y.b && x.sig == y.sig && x.R == y.R && x.Rlo == y.Rlo && x.Rhi == y.Rhi && x.W == y.W; }
+    printf("head: %zu of %zu cells differ, %zu of %zu keys differ, the values are %s\n", diff, n, dk, nk, same ? "equal" : "NOT EQUAL");
+    if (diff || dk || !same) return 1;
+  }
   const HeadShape2 &s = W.s;
   for (size_t i = 0; i < W.calls.size(); i++) {
     std::vector<LookupCall> one{W.calls[i]};
